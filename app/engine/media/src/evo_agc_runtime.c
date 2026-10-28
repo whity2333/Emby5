@@ -145,12 +145,78 @@ typedef char evo_tile_dims_must_be_pow2[
  * HDR10: Bgr10A2Bt2100Pq - 10:10:10:2, BT.2020 primaries, ST.2084 PQ
  * (third_party/SharpProspero VideoOutTypes.cs). Note the 0x22000000 bits are
  * the RGB-vs-BGR channel order, not tiling: Rgba8Srgb is 0x8000000022000000
- * and Bgra8Srgb 0x8000000000000000. EVO's scanout is BGR ordered (the GPU
- * writes it with COMP_SWAP=ALT), so HDR must be the BGR variant too - the
- * RGB one this used to hold would swap red and blue. Used by
- * evo_agc_runtime_set_hdr_output().
+ * and Bgra8Srgb 0x8000000000000000. Pairs with COMP_SWAP=ALT (B,G,R,A in
+ * memory). Used by evo_agc_runtime_set_hdr_output().
  */
 #define EVO_AGC_VIDEO_FORMAT_HDR UINT64_C(0x8100070400000000)
+
+/*
+ * The RGB half of each pair. Registering Bgr10A2Bt2100Pq is refused outright on
+ * firmware 12.40 (RegisterBuffers2 -> 0x80290003) while Bgra8Srgb succeeds, so
+ * the BGR 10-bit encodings are not accepted there at all. The RGB encodings are
+ * what a retail title (PPSA01317) registers when its output reports HDR.
+ *
+ * The channel order and COMP_SWAP are one decision: RGB format wants the colour
+ * block to store R,G,B,A (COMP_SWAP=STD), BGR wants B,G,R,A (ALT). Mixing them
+ * is what turns the picture into swapped colours.
+ */
+#define EVO_AGC_VIDEO_FORMAT_SDR_RGB UINT64_C(0x8000000022000000)
+#define EVO_AGC_VIDEO_FORMAT_HDR_RGB UINT64_C(0x8100070422000000)
+
+/* 1 = scanout is RGBA with COMP_SWAP=STD; 0 = BGRA with ALT (the default). */
+static int s_scanout_rgb;
+/* -1 = derive from s_scanout_rgb, 0/1 = force. display.conf scanout_swap=. */
+static int s_scanout_swap = -1;
+
+static uint64_t scanout_format(int hdr)
+{
+    if (s_scanout_rgb)
+        return hdr ? EVO_AGC_VIDEO_FORMAT_HDR_RGB : EVO_AGC_VIDEO_FORMAT_SDR_RGB;
+    return hdr ? EVO_AGC_VIDEO_FORMAT_HDR : EVO_AGC_VIDEO_FORMAT_SDR;
+}
+
+static int scanout_comp_swap_alt(void)
+{
+    if (s_scanout_swap >= 0)
+        return s_scanout_swap;
+    return s_scanout_rgb ? 0 : 1;
+}
+
+/* Retypes CB_COLOR0_INFO between COLOR_8_8_8_8 and COLOR_2_10_10_10. Defined
+ * with the runtime HDR switch, needed by the HDR bring-up in init() too. */
+static void agc_scanout_set_10bit(int ten_bit);
+
+/*
+ * /data/Emby5/display.conf tunables for the scanout retype, read once at init.
+ * Both halves of the pairing are switchable so a wrong guess can be corrected
+ * by editing a file on the console instead of rebuilding:
+ *
+ *   scanout_rgb=1   register the Rgb10A2/Rgba8 encodings instead of the Bgr
+ *                   ones, and store R,G,B,A (COMP_SWAP=STD) to match
+ *   scanout_swap=N  force COMP_SWAP: 1 = ALT (B,G,R,A), 0 = STD (R,G,B,A)
+ *
+ * The defaults are the ones proven on hardware: SDR registers Bgra8 with
+ * COMP_SWAP=ALT, HDR registers Rgb10A2Bt2100Pq with STD because 12.40 refuses
+ * the BGR 10-bit encoding outright.
+ */
+static void scanout_load_conf(void)
+{
+    FILE *fp = fopen("/data/Emby5/display.conf", "r");
+    if (!fp)
+        return;
+    char line[128];
+    while (fgets(line, sizeof line, fp)) {
+        int v = 0;
+        if (sscanf(line, "scanout_rgb=%d", &v) == 1)
+            s_scanout_rgb = v ? 1 : 0;
+        else if (sscanf(line, "scanout_swap=%d", &v) == 1)
+            s_scanout_swap = v ? 1 : 0;
+    }
+    fclose(fp);
+    if (s_scanout_rgb || s_scanout_swap >= 0)
+        evo_boot_log("agc scanout conf: rgb=%d swap=%d",
+                     s_scanout_rgb, s_scanout_swap);
+}
 
 /* Platform declarations */
 int32_t sceKernelAllocateDirectMemory(int64_t search_start, int64_t search_end,
@@ -1048,9 +1114,11 @@ static int evo_agc_apply_render_size(void *agc_defaults, int w, int h)
         ((((size_t)g_agc_dev.composite_pitch * (size_t)h) + 255u) & ~(size_t)255);
 
     int ct0 = setup_color_target(g_agc_dev.gpu_regs->color_targets[0], agc_defaults,
-                                 g_agc_dev.scanout_buffers[0], w, h, 1);
+                                 g_agc_dev.scanout_buffers[0], w, h,
+                                 scanout_comp_swap_alt());
     int ct1 = setup_color_target(g_agc_dev.gpu_regs->color_targets[1], agc_defaults,
-                                 g_agc_dev.scanout_buffers[1], w, h, 1);
+                                 g_agc_dev.scanout_buffers[1], w, h,
+                                 scanout_comp_swap_alt());
     setup_depth_target(g_agc_dev.gpu_regs->depth_target, g_agc_dev.depth_base,
                        g_agc_dev.stencil_base, (uint32_t)w, (uint32_t)h);
 
@@ -1087,6 +1155,12 @@ int evo_agc_runtime_init(int width, int height, int hdr)
     g_agc_dev.width = width ? width : 1920;
     g_agc_dev.height = height ? height : 1080;
     g_agc_dev.is_hdr = hdr;
+    /* An HDR bring-up uses the RGB pairing: the BGR 10-bit encodings are
+     * refused on this firmware, and the pairing has to be chosen before the
+     * buffers are registered - it cannot be changed later. display.conf can
+     * override either half for a test run. */
+    s_scanout_rgb = hdr ? 1 : 0;
+    scanout_load_conf();
     g_agc_dev.last_video_trc = -1;
     g_agc_dev.video_handle = -1;
     g_agc_dev.up.cap = EVO_AGC_UPSCALE_AI;
@@ -1237,9 +1311,11 @@ int evo_agc_runtime_init(int width, int height, int hdr)
      * path spent a session chasing. It was being called for its side effect
      * with the result dropped; fail the init instead. */
     int ct0 = setup_color_target(g_agc_dev.gpu_regs->color_targets[0], agc_defaults,
-                                 g_agc_dev.scanout_buffers[0], g_agc_dev.width, g_agc_dev.height, 1);
+                                 g_agc_dev.scanout_buffers[0], g_agc_dev.width,
+                                 g_agc_dev.height, scanout_comp_swap_alt());
     int ct1 = setup_color_target(g_agc_dev.gpu_regs->color_targets[1], agc_defaults,
-                                 g_agc_dev.scanout_buffers[1], g_agc_dev.width, g_agc_dev.height, 1);
+                                 g_agc_dev.scanout_buffers[1], g_agc_dev.width,
+                                 g_agc_dev.height, scanout_comp_swap_alt());
     setup_depth_target(g_agc_dev.gpu_regs->depth_target, g_agc_dev.depth_base,
                        g_agc_dev.stencil_base,
                        (uint32_t)g_agc_dev.width, (uint32_t)g_agc_dev.height);
@@ -1270,6 +1346,13 @@ int evo_agc_runtime_init(int width, int height, int hdr)
         printf(EVO_AGC_LOG_PREFIX "setup_color_target failed: %d/%d\n", ct0, ct1);
         goto cleanup_fail;
     }
+    /* The registered pixel format and CB_COLOR0_INFO's FORMAT have to agree:
+     * a 10:10:10:2 buffer written through an 8_8_8_8 UNORM colour target gets
+     * one channel per 32-bit word spread over the wrong bits. setup_color_target
+     * always writes the 8-bit encoding, so an HDR bring-up has to retype it
+     * here - set_hdr_output() only does it when switching at runtime. */
+    if (hdr)
+        agc_scanout_set_10bit(1);
 
     /* 5. Compile All AGC Pipelines */
     /* Only the UI pipeline is required. The video pipelines are converted to
@@ -1501,7 +1584,7 @@ int evo_agc_runtime_init(int width, int height, int hdr)
     evo_video_attribute_t attr;
     memset(&attr, 0, sizeof(attr));
 
-    uint64_t vfmt = g_agc_dev.is_hdr ? EVO_AGC_VIDEO_FORMAT_HDR : EVO_AGC_VIDEO_FORMAT_SDR;
+    uint64_t vfmt = scanout_format(g_agc_dev.is_hdr);
     sceVideoOutSetBufferAttribute2(&attr, vfmt, 0,
                                    (uint32_t)g_agc_dev.width, (uint32_t)g_agc_dev.height,
                                    0, 0, 0);
@@ -2571,15 +2654,27 @@ int evo_agc_probe_rgb(uint8_t *rgb, int n)
         uint32_t px = *pixel_addr;
 
         if (is_hdr) {
-            /* 10:10:10:2 Bgr10A2 -> scale 10-bit to 8-bit */
-            rgb[i * 3 + 0] = (uint8_t)(((px >> 20) & 0x3FF) >> 2); /* R */
-            rgb[i * 3 + 1] = (uint8_t)(((px >> 10) & 0x3FF) >> 2); /* G */
-            rgb[i * 3 + 2] = (uint8_t)((px         & 0x3FF) >> 2); /* B */
+            /* 10:10:10:2 -> scale 10-bit to 8-bit. Bgr10A2 stores B,G,R in the
+             * low three words; the Rgb variant stores R,G,B. */
+            if (s_scanout_rgb) {
+                rgb[i * 3 + 0] = (uint8_t)(((px >> 20) & 0x3FF) >> 2); /* R */
+                rgb[i * 3 + 1] = (uint8_t)(((px >> 10) & 0x3FF) >> 2); /* G */
+                rgb[i * 3 + 2] = (uint8_t)((px         & 0x3FF) >> 2); /* B */
+            } else {
+                rgb[i * 3 + 0] = (uint8_t)((px         & 0x3FF) >> 2); /* R */
+                rgb[i * 3 + 1] = (uint8_t)(((px >> 10) & 0x3FF) >> 2); /* G */
+                rgb[i * 3 + 2] = (uint8_t)(((px >> 20) & 0x3FF) >> 2); /* B */
+            }
         } else {
-            /* 8:8:8:8 Bgra8 */
-            rgb[i * 3 + 0] = (uint8_t)((px >> 16) & 0xFF);         /* R */
-            rgb[i * 3 + 1] = (uint8_t)((px >> 8)  & 0xFF);         /* G */
-            rgb[i * 3 + 2] = (uint8_t)(px         & 0xFF);         /* B */
+            if (s_scanout_rgb) {
+                rgb[i * 3 + 0] = (uint8_t)(px         & 0xFF);         /* R */
+                rgb[i * 3 + 1] = (uint8_t)((px >> 8)  & 0xFF);         /* G */
+                rgb[i * 3 + 2] = (uint8_t)((px >> 16) & 0xFF);         /* B */
+            } else {
+                rgb[i * 3 + 0] = (uint8_t)((px >> 16) & 0xFF);         /* R */
+                rgb[i * 3 + 1] = (uint8_t)((px >> 8)  & 0xFF);         /* G */
+                rgb[i * 3 + 2] = (uint8_t)(px         & 0xFF);         /* B */
+            }
         }
     }
     return n;
@@ -2663,9 +2758,9 @@ int evo_agc_runtime_get_refresh_rate(void)
 
 /* CB_COLOR0_INFO is word 2 of every block setup_color_target() builds (the
  * upscaler patches the same word for its FP16 targets). FORMAT is bits 2..6:
- * COLOR_8_8_8_8 = 10, COLOR_2_10_10_10 = 9. NUMBER_TYPE stays UNORM and
- * COMP_SWAP stays ALT, so the 10:10:10:2 word is BGR ordered like the
- * 8-bit one - matching Bgr10A2Bt2100Pq. */
+ * COLOR_8_8_8_8 = 10, COLOR_2_10_10_10 = 9. NUMBER_TYPE stays UNORM. COMP_SWAP
+ * is left alone here - setup_color_target already set it to match the
+ * registered channel order (ALT for the Bgr encodings, STD for the Rgb ones). */
 static void agc_scanout_set_10bit(int ten_bit)
 {
     for (int i = 0; i < 2; ++i) {
@@ -2694,9 +2789,11 @@ int evo_agc_runtime_set_hdr_output(int enable)
         return -1;
     }
 
-    const uint64_t vfmt = enable ? EVO_AGC_VIDEO_FORMAT_HDR : EVO_AGC_VIDEO_FORMAT_SDR;
+    const uint64_t vfmt = scanout_format(enable);
     evo_boot_log("agc hdr: switching scanout to %s (fmt=%#llx)",
-                 enable ? "HDR10 Bgr10A2Bt2100Pq" : "SDR Bgra8",
+                 enable ? (s_scanout_rgb ? "HDR10 Rgb10A2Bt2100Pq"
+                                         : "HDR10 Bgr10A2Bt2100Pq")
+                        : (s_scanout_rgb ? "SDR Rgba8" : "SDR Bgra8"),
                  (unsigned long long)vfmt);
     evo_boot_log_flush();
 
@@ -2822,7 +2919,7 @@ int evo_agc_runtime_set_120hz(int enable)
             };
             evo_video_attribute_t attr;
             memset(&attr, 0, sizeof(attr));
-            uint64_t vfmt = g_agc_dev.is_hdr ? EVO_AGC_VIDEO_FORMAT_HDR : EVO_AGC_VIDEO_FORMAT_SDR;
+            uint64_t vfmt = scanout_format(g_agc_dev.is_hdr);
             sceVideoOutSetBufferAttribute2(&attr, vfmt, 0,
                                            (uint32_t)g_agc_dev.width, (uint32_t)g_agc_dev.height,
                                            0, 0, 0);
