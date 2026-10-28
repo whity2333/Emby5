@@ -66,10 +66,10 @@ struct evo_stream_io_ctx {
      * evo_stream_io_close(). NULL for an ordinary stream. */
     void *udf_pb;
     void *udf_handle;
-    /* Title length in 45 kHz ticks, from the image's playlist. Applied to the
-     * demuxer in evo_stream_io_probe(): mpegts estimates a seek position from
-     * the duration, and with none every seek lands at byte 0. */
-    int64_t udf_duration_45k;
+    /* What the image's playlist says about the title: length in 45 kHz ticks
+     * and the language of every audio/subtitle stream. Applied to the demuxer
+     * and its streams in evo_stream_io_probe(). */
+    evo_udf_title udf_title;
 };
 
 static _Thread_local int (*s_open_interrupt)(void *);
@@ -116,8 +116,8 @@ int evo_stream_io_probe(evo_stream_io_ctx_t *ctx, AVFormatContext *fmt, double s
      * duration 0 the estimate is always 0, so every seek reported success and
      * restarted the title. Only fills a duration that is still missing.
      */
-    if (ctx && ctx->udf_duration_45k > 0 && fmt->duration <= 0) {
-        fmt->duration = av_rescale(ctx->udf_duration_45k, AV_TIME_BASE, 45000);
+    if (ctx && ctx->udf_title.duration_45k > 0 && fmt->duration <= 0) {
+        fmt->duration = av_rescale(ctx->udf_title.duration_45k, AV_TIME_BASE, 45000);
         for (unsigned i = 0; i < fmt->nb_streams; i++) {
             AVStream *st = fmt->streams[i];
             if (st && st->duration <= 0 && st->time_base.num > 0)
@@ -125,6 +125,30 @@ int evo_stream_io_probe(evo_stream_io_ctx_t *ctx, AVFormatContext *fmt, double s
         }
         evo_boot_log("ISO: demuxer duration set to %.3f s from the playlist",
                      (double)fmt->duration / AV_TIME_BASE);
+    }
+    /*
+     * The playlist knows the language of every stream; the PMT of a Blu-ray
+     * image usually does not, so FFmpeg reports none and the player labels all
+     * of them "unknown language". Streams are matched by PID - for mpegts
+     * AVStream.id is the PID the playlist refers to.
+     */
+    if (ctx && ctx->udf_title.ntracks > 0) {
+        int applied = 0;
+
+        for (int t = 0; t < ctx->udf_title.ntracks; t++) {
+            const evo_udf_track *tr = &ctx->udf_title.tracks[t];
+            for (unsigned i = 0; i < fmt->nb_streams; i++) {
+                AVStream *st = fmt->streams[i];
+                if (!st || st->id != tr->pid)
+                    continue;
+                if (!tr->lang[0])
+                    continue;
+                av_dict_set(&st->metadata, "language", tr->lang, 0);
+                applied++;
+                break;
+            }
+        }
+        evo_boot_log("ISO: applied %d track language(s) from the playlist", applied);
     }
     /* find_stream_info may return success after an interrupted read. */
     return evo_stream_io_is_aborted(ctx) ? AVERROR_EXIT : rc;
@@ -513,7 +537,7 @@ int evo_stream_io_open(const char *path,
          *
          * Probed once per distinct path so a retry loop cannot spam it.
          */
-        int64_t iso_off = 0, iso_size = 0, iso_dur45k = -1;
+        evo_udf_title iso;
 
         {
             static char s_last_probed[512];
@@ -523,10 +547,12 @@ int evo_stream_io_open(const char *path,
             }
         }
 
-        if (path && evo_udf_main_title(path, &iso_off, &iso_size, &iso_dur45k) == 0) {
+        memset(&iso, 0, sizeof iso);
+
+        if (path && evo_udf_main_title(path, &iso) == 0) {
             void *pb = NULL, *handle = NULL;
 
-            if (evo_udf_open_window(path, iso_off, iso_size, &pb, &handle) == 0) {
+            if (evo_udf_open_window(path, iso.offset, iso.size, &pb, &handle) == 0) {
                 AVFormatContext *fmt2 = avformat_alloc_context();
 
                 if (fmt2) {
@@ -542,7 +568,7 @@ int evo_stream_io_open(const char *path,
                     if (rc >= 0 && fmt2) {
                         ctx->udf_pb     = pb;
                         ctx->udf_handle = handle;
-                        ctx->udf_duration_45k = iso_dur45k;
+                        ctx->udf_title = iso;
                         *out_fmt_ctx = fmt2;
                         if (out_io_ctx) *out_io_ctx = ctx;
                         SIO_BC("P8_01f_ISO_TITLE", "opened main title from image");

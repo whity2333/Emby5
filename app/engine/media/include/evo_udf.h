@@ -21,6 +21,23 @@
 extern "C" {
 #endif
 
+#define EVO_UDF_MAX_TRACKS 32
+
+/* One audio or subtitle stream, as the playlist describes it. */
+typedef struct {
+    uint16_t pid;      /* matches AVStream.id for a mpegts stream */
+    char     lang[4];  /* ISO-639, may be empty */
+} evo_udf_track;
+
+/* What the playlist says about the title we picked. */
+typedef struct {
+    int64_t offset;        /* byte offset of the .m2ts inside the image */
+    int64_t size;          /* its length */
+    int64_t duration_45k;  /* title length in 45 kHz ticks, -1 when unknown */
+    int     ntracks;
+    evo_udf_track tracks[EVO_UDF_MAX_TRACKS];
+} evo_udf_title;
+
 /*
  * Open `url` (local path or http(s)), read its UDF filesystem, and log the
  * BDMV tree: playlists, stream files, sizes, and which .m2ts looks like the
@@ -32,22 +49,21 @@ extern "C" {
 int evo_udf_inspect(const char *url);
 
 /*
- * Locate the main title inside `url` without logging the whole tree.
- * On success fills *offset (byte offset of the .m2ts inside the image) and
- * *size (its length in bytes) and returns 0. Returns -1 when the image has no
- * usable BDMV/STREAM entry.
+ * Locate the main title inside `url` and describe it in `out`.
  *
- * *duration_45k receives the title's length in 45 kHz ticks, read from the
- * playlist that references this clip, or -1 when no playlist matched. The
- * demuxer needs it: mpegts estimates a seek position from the duration, and
- * with none every seek lands at byte 0.
+ * The title is the largest .m2ts. That is a heuristic: right on a plain disc,
+ * wrong on a seamless-branching one, where the feature is split across several
+ * .m2ts and only the .mpls knows the order.
  *
- * The title is the largest .m2ts. That is a heuristic: it is right on a plain
- * disc and wrong on a seamless-branching one, where the feature is split
- * across several .m2ts and only the .mpls knows the order. Reported as such.
+ * `out` gets the title's byte range, its duration, and the language of every
+ * audio and subtitle stream the playlist lists. Those languages are the point:
+ * a Blu-ray PMT often carries no ISO-639 descriptor, so FFmpeg reports none and
+ * the player shows "unknown language" for every track. The playlist always has
+ * them.
+ *
+ * Returns 0 on success, -1 when the image has no usable BDMV/STREAM entry.
  */
-int evo_udf_main_title(const char *url, int64_t *offset, int64_t *size,
-                       int64_t *duration_45k);
+int evo_udf_main_title(const char *url, evo_udf_title *out);
 
 /*
  * Build an AVIOContext that exposes only [offset, offset+size) of `url`.
