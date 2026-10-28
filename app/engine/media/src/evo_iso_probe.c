@@ -19,6 +19,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "evo_iso_probe.h"
+#include "evo_udf.h"
 #include "evo_boot_log.h"
 
 #include <libavformat/avio.h>
@@ -167,6 +168,7 @@ int evo_iso_probe(const char *path)
     AVIOContext *io = NULL;
     AVDictionary *opts = NULL;
     int is_iso = 0;
+    int has_udf = 0;
 
     if (!path || !*path)
         return -1;
@@ -191,12 +193,20 @@ int evo_iso_probe(const char *path)
 
     if (probe_iso9660(io) == 0)
         is_iso = 1;
-    if (probe_udf(io) == 0)
+    if (probe_udf(io) == 0) {
         is_iso = 1;
+        has_udf = 1;
+    }
 
     if (!is_iso)
         evo_boot_log("ISO probe: no ISO9660 or UDF signature found");
 
     avio_closep(&io);
+
+    /* The real filesystem walk needs its own connection: libudfread drives the
+     * reads through its own block callbacks. */
+    if (has_udf)
+        evo_udf_inspect(path);
+
     return is_iso ? 0 : -1;
 }

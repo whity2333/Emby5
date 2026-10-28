@@ -18,9 +18,10 @@ OBJDIR := build/obj
 # sceVideodec2 incl. 10-bit). NUVIO_APP marks the places this app changed.
 DEFS := -DNUVIO_APP=1 -DEVO_APP_MODULE=1 -DEVO_AGC_DEVICE=1 -DEVO_AGC_HAVE_VIDEO_PIPES=1 -DEVO_TARGET_PS5=1 \
         -DEVO_VDEC_NATIVE_10BIT=1 -DEVO_NUVIO_EDITION=1 -DPP_4K_PRODUCT_STAGE=4 \
+        -DHAVE_CONFIG_H=1 \
         -DEVO_PLAYER_VERSION=\"emby5\" $(EMBY5_DEFS)
 
-INCS := -Isrc -Isrc/shim -Ithird_party \
+INCS := -Isrc -Isrc/shim -Ithird_party -Ithird_party/libudfread/src \
         -Iengine/core/include -Iengine/include -Iengine/pp/include \
         -Iengine/media/include -Iengine/addons/include -Iengine/shaders/agc \
         -I$(HB)/include -I$(HB)/include/freetype2 -I$(HB)/include/harfbuzz \
@@ -30,7 +31,8 @@ CFLAGS   := -O2 -g -Wall -Wno-unused-parameter $(TFLAGS) $(DEFS) $(INCS)
 CXXFLAGS := -O2 -g -Wall -Wno-unused-parameter -std=c++17 $(TFLAGS) $(DEFS) $(INCS)
 
 ENGINE_C := $(wildcard engine/media/src/*.c) $(wildcard engine/pp/src/*.c) \
-            $(wildcard engine/src/*.c) engine/addons/src/cJSON.c
+            $(wildcard engine/src/*.c) engine/addons/src/cJSON.c \
+            $(wildcard third_party/libudfread/src/*.c)
 ENGINE_CXX := engine/core/src/services/PlaybackController.cpp
 # Nuvio's system-browser host is not part of Emby5 (no WebBrowserDialog import).
 # Nuvio's payload link (browser host, bridge, control) is replaced by
