@@ -8,9 +8,13 @@
  * supplies them on top of the same avio connection: a seek becomes an HTTP
  * range request, which is exactly what a disc image needs.
  *
- * Stage 1: inspect and log only. The BDMV tree, the playlist names and the
- * candidate main title are reported so the next stage can pick a title with
- * evidence rather than a guess.
+ * Two things are built here:
+ *
+ *   udf_walk()        mount the image, find BDMV/STREAM, pick a title
+ *   evo_udf_open_window() expose that title as a small seekable AVIOContext
+ *
+ * The demuxer then sees an ordinary mpegts stream and none of the playback
+ * path changes.
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -22,6 +26,8 @@
 
 #include <libavformat/avio.h>
 #include <libavutil/dict.h>
+#include <libavutil/error.h>
+#include <libavutil/mem.h>
 
 #include <pthread.h>
 #include <stdio.h>
@@ -31,6 +37,14 @@
 
 /* How many entries of each kind to log before summarising the rest. */
 #define UDF_LOG_LIMIT 24
+
+/* Read-ahead for the windowed stream. A disc title is read sequentially at
+ * 60-100 Mbit/s; 256 KiB keeps the range requests large enough to amortise. */
+#define WIN_BUFFER (256 * 1024)
+
+/* ------------------------------------------------------------------ */
+/* udfread block input backed by avio                                  */
+/* ------------------------------------------------------------------ */
 
 typedef struct {
     udfread_block_input bi;      /* must be first: the callbacks cast back */
@@ -86,6 +100,10 @@ static int ai_close(udfread_block_input *in)
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* helpers                                                             */
+/* ------------------------------------------------------------------ */
+
 static int ends_with_ci(const char *s, const char *suffix)
 {
     size_t ls = strlen(s), lf = strlen(suffix);
@@ -101,8 +119,24 @@ static int ends_with_ci(const char *s, const char *suffix)
     return 1;
 }
 
-/* Walk one BDMV subdirectory, logging names. Returns the entry count. */
-static int list_dir(udfread *udf, UDFDIR *parent, const char *name, const char *tag)
+static AVIOContext *open_avio(const char *url, const char *agent, int timeout_ms)
+{
+    AVDictionary *opts = NULL;
+    AVIOContext *io = NULL;
+    char t[24];
+
+    snprintf(t, sizeof t, "%d", timeout_ms);
+    av_dict_set(&opts, "rw_timeout", t, 0);
+    av_dict_set(&opts, "user_agent", agent, 0);
+
+    if (avio_open2(&io, url, AVIO_FLAG_READ, NULL, &opts) < 0)
+        io = NULL;
+    av_dict_free(&opts);
+    return io;
+}
+
+/* Walk one BDMV subdirectory, logging names. */
+static void list_dir(udfread *udf, UDFDIR *parent, const char *name, const char *tag)
 {
     UDFDIR *d = udfread_opendir_at(parent, name);
     struct udfread_dirent e;
@@ -110,7 +144,7 @@ static int list_dir(udfread *udf, UDFDIR *parent, const char *name, const char *
 
     if (!d) {
         evo_boot_log("UDF: %s/%s not present", tag, name);
-        return 0;
+        return;
     }
     while (udfread_readdir(d, &e)) {
         if (!e.d_name || !strcmp(e.d_name, ".") || !strcmp(e.d_name, ".."))
@@ -122,109 +156,33 @@ static int list_dir(udfread *udf, UDFDIR *parent, const char *name, const char *
     udfread_closedir(d);
     if (n > UDF_LOG_LIMIT)
         evo_boot_log("UDF: %s/%s ... %d entries total", tag, name, n);
-    return n;
 }
 
 /*
- * List BDMV/STREAM and report sizes. The largest .m2ts is the usual main
- * feature on a simple disc; it is a guess, and the log says so.
+ * Mount the image, pick the main title. `log_tree` controls how much goes to
+ * the log: the playback path asks for the numbers only.
  */
-static int scan_streams(udfread *udf)
+static int udf_walk(const char *url, int log_tree,
+                    int64_t *out_offset, int64_t *out_size)
 {
-    UDFDIR *bdmv = udfread_opendir(udf, "BDMV");
-    UDFDIR *stream;
+    avio_input *in;
+    udfread *udf;
+    UDFDIR *bdmv, *stream;
     struct udfread_dirent e;
-    int n = 0, shown = 0;
+    int n = 0, shown = 0, rc;
     int64_t best_size = -1;
     uint32_t best_lba = 0;
     char best_name[256];
 
     best_name[0] = 0;
 
-    if (!bdmv) {
-        evo_boot_log("UDF: no BDMV directory at the image root");
-        return -1;
-    }
-
-    /* Playlists first: they name the real title, and the next stage needs them. */
-    list_dir(udf, bdmv, "PLAYLIST", "BDMV");
-
-    stream = udfread_opendir_at(bdmv, "STREAM");
-    if (!stream) {
-        evo_boot_log("UDF: no BDMV/STREAM directory");
-        udfread_closedir(bdmv);
-        return -1;
-    }
-
-    while (udfread_readdir(stream, &e)) {
-        char path[320];
-        UDFFILE *f;
-        int64_t size;
-        uint32_t lba;
-
-        if (!e.d_name || !ends_with_ci(e.d_name, ".m2ts"))
-            continue;
-
-        snprintf(path, sizeof path, "BDMV/STREAM/%s", e.d_name);
-        f = udfread_file_open(udf, path);
-        if (!f) {
-            evo_boot_log("UDF: stream %s: could not open", e.d_name);
-            continue;
-        }
-        size = udfread_file_size(f);
-        lba  = udfread_file_lba(f, 0);
-        udfread_file_close(f);
-
-        n++;
-        if (shown < UDF_LOG_LIMIT) {
-            evo_boot_log("UDF: stream %s  size=%lld  lba=%u  offset=%lld",
-                         e.d_name, (long long)size, lba,
-                         (long long)lba * UDF_BLOCK_SIZE);
-            shown++;
-        }
-
-        if (size > best_size) {
-            best_size = size;
-            best_lba  = lba;
-            snprintf(best_name, sizeof best_name, "%s", e.d_name);
-        }
-    }
-
-    udfread_closedir(stream);
-    udfread_closedir(bdmv);
-
-    if (n == 0) {
-        evo_boot_log("UDF: BDMV/STREAM has no .m2ts files");
-        return 0;
-    }
-
-    evo_boot_log("UDF: %d stream file(s); largest is %s  size=%lld  offset=%lld  "
-                 "(heuristic: main feature)",
-                 n, best_name, (long long)best_size,
-                 (long long)best_lba * UDF_BLOCK_SIZE);
-    return n;
-}
-
-int evo_udf_inspect(const char *url)
-{
-    avio_input *in;
-    AVDictionary *opts = NULL;
-    udfread *udf;
-    int rc, titles;
-
-    if (!url || !*url)
-        return -1;
-
     in = (avio_input *)calloc(1, sizeof *in);
     if (!in)
         return -1;
 
-    av_dict_set(&opts, "rw_timeout", "15000000", 0);
-    av_dict_set(&opts, "user_agent", "Emby5 UDF inspect", 0);
-    rc = avio_open2(&in->io, url, AVIO_FLAG_READ, NULL, &opts);
-    av_dict_free(&opts);
-    if (rc < 0) {
-        evo_boot_log("UDF: could not open the image (%d)", rc);
+    in->io = open_avio(url, "Emby5 UDF", 15000);
+    if (!in->io) {
+        evo_boot_log("UDF: could not open the image");
         free(in);
         return -1;
     }
@@ -252,7 +210,7 @@ int evo_udf_inspect(const char *url)
         return -1;
     }
 
-    {
+    if (log_tree) {
         const char *vid = udfread_get_volume_id(udf);
         evo_boot_log("UDF: mounted, volume='%s', %lld blocks of %d bytes",
                      vid ? vid : "?",
@@ -260,9 +218,248 @@ int evo_udf_inspect(const char *url)
                      UDF_BLOCK_SIZE);
     }
 
-    titles = scan_streams(udf);
+    bdmv = udfread_opendir(udf, "BDMV");
+    if (!bdmv) {
+        evo_boot_log("UDF: no BDMV directory at the image root");
+        udfread_close(udf);
+        return -1;
+    }
+    if (log_tree)
+        list_dir(udf, bdmv, "PLAYLIST", "BDMV");
+
+    stream = udfread_opendir_at(bdmv, "STREAM");
+    if (!stream) {
+        evo_boot_log("UDF: no BDMV/STREAM directory");
+        udfread_closedir(bdmv);
+        udfread_close(udf);
+        return -1;
+    }
+
+    while (udfread_readdir(stream, &e)) {
+        char path[320];
+        UDFFILE *f;
+        int64_t size;
+        uint32_t lba;
+
+        if (!e.d_name || !ends_with_ci(e.d_name, ".m2ts"))
+            continue;
+
+        snprintf(path, sizeof path, "BDMV/STREAM/%s", e.d_name);
+        f = udfread_file_open(udf, path);
+        if (!f) {
+            evo_boot_log("UDF: stream %s: could not open", e.d_name);
+            continue;
+        }
+        size = udfread_file_size(f);
+        lba  = udfread_file_lba(f, 0);
+        udfread_file_close(f);
+
+        n++;
+        if (log_tree && shown < UDF_LOG_LIMIT) {
+            evo_boot_log("UDF: stream %s  size=%lld  lba=%u  offset=%lld",
+                         e.d_name, (long long)size, lba,
+                         (long long)lba * UDF_BLOCK_SIZE);
+            shown++;
+        }
+
+        if (size > best_size) {
+            best_size = size;
+            best_lba  = lba;
+            snprintf(best_name, sizeof best_name, "%s", e.d_name);
+        }
+    }
+
+    udfread_closedir(stream);
+    udfread_closedir(bdmv);
+
+    if (n == 0) {
+        evo_boot_log("UDF: BDMV/STREAM has no .m2ts files");
+        udfread_close(udf);
+        return 0;
+    }
+
+    if (log_tree) {
+        evo_boot_log("UDF: %d stream file(s); largest is %s  size=%lld  offset=%lld  "
+                     "(heuristic: main feature)",
+                     n, best_name, (long long)best_size,
+                     (long long)best_lba * UDF_BLOCK_SIZE);
+    }
+
+    if (out_offset) *out_offset = (int64_t)best_lba * UDF_BLOCK_SIZE;
+    if (out_size)   *out_size   = best_size;
 
     /* udfread_close() calls our close(), which frees `in`. */
     udfread_close(udf);
-    return titles;
+    return n;
+}
+
+/* ------------------------------------------------------------------ */
+/* windowed AVIO: [offset, offset+size) of the image, as a plain file   */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    AVIOContext    *under;
+    int64_t         base;
+    int64_t         size;
+    int64_t         pos;
+    pthread_mutex_t lock;
+} win_io;
+
+static int win_read(void *opaque, uint8_t *buf, int n)
+{
+    win_io *w = (win_io *)opaque;
+    int64_t left = w->size - w->pos;
+    int r;
+
+    if (left <= 0)
+        return AVERROR_EOF;
+    if ((int64_t)n > left)
+        n = (int)left;
+
+    pthread_mutex_lock(&w->lock);
+    r = avio_read(w->under, buf, n);
+    if (r > 0)
+        w->pos += r;
+    pthread_mutex_unlock(&w->lock);
+
+    return r;
+}
+
+static int64_t win_seek(void *opaque, int64_t off, int whence)
+{
+    win_io *w = (win_io *)opaque;
+    int64_t target, r;
+
+    switch (whence) {
+    case AVSEEK_SIZE:
+        return w->size;
+    case SEEK_SET:
+        target = off;
+        break;
+    case SEEK_CUR:
+        target = w->pos + off;
+        break;
+    case SEEK_END:
+        target = w->size + off;
+        break;
+    default:
+        return AVERROR(EINVAL);
+    }
+
+    if (target < 0)
+        target = 0;
+    if (target > w->size)
+        target = w->size;
+
+    pthread_mutex_lock(&w->lock);
+    r = avio_seek(w->under, w->base + target, SEEK_SET);
+    if (r >= 0) {
+        w->pos = target;
+        r = target;
+    }
+    pthread_mutex_unlock(&w->lock);
+
+    return r;
+}
+
+/* ------------------------------------------------------------------ */
+/* public                                                              */
+/* ------------------------------------------------------------------ */
+
+int evo_udf_inspect(const char *url)
+{
+    if (!url || !*url)
+        return -1;
+    return udf_walk(url, 1, NULL, NULL);
+}
+
+int evo_udf_main_title(const char *url, int64_t *offset, int64_t *size)
+{
+    int64_t off = 0, len = 0;
+
+    if (!url || !*url || !offset || !size)
+        return -1;
+
+    if (udf_walk(url, 0, &off, &len) <= 0 || len <= 0)
+        return -1;
+
+    *offset = off;
+    *size   = len;
+    return 0;
+}
+
+int evo_udf_open_window(const char *url, int64_t offset, int64_t size,
+                        void **out_pb, void **out_handle)
+{
+    win_io *w;
+    AVIOContext *pb;
+    unsigned char *buf;
+
+    if (!url || !out_pb || !out_handle || size <= 0)
+        return -1;
+
+    w = (win_io *)calloc(1, sizeof *w);
+    if (!w)
+        return -1;
+
+    w->under = open_avio(url, "Emby5 ISO", 15000);
+    if (!w->under) {
+        evo_boot_log("UDF: window: could not reopen the image");
+        free(w);
+        return -1;
+    }
+
+    w->base = offset;
+    w->size = size;
+    w->pos  = 0;
+    pthread_mutex_init(&w->lock, NULL);
+
+    /* Start at the title's first byte; the demuxer will seek from here. */
+    if (avio_seek(w->under, offset, SEEK_SET) < 0) {
+        evo_boot_log("UDF: window: seek to %lld failed", (long long)offset);
+        avio_closep(&w->under);
+        pthread_mutex_destroy(&w->lock);
+        free(w);
+        return -1;
+    }
+
+    buf = (unsigned char *)av_malloc(WIN_BUFFER);
+    if (!buf) {
+        avio_closep(&w->under);
+        pthread_mutex_destroy(&w->lock);
+        free(w);
+        return -1;
+    }
+
+    pb = avio_alloc_context(buf, WIN_BUFFER, 0, w, win_read, NULL, win_seek);
+    if (!pb) {
+        av_free(buf);
+        avio_closep(&w->under);
+        pthread_mutex_destroy(&w->lock);
+        free(w);
+        return -1;
+    }
+
+    *out_pb     = pb;
+    *out_handle = w;
+    evo_boot_log("UDF: window ready, %lld bytes at offset %lld",
+                 (long long)size, (long long)offset);
+    return 0;
+}
+
+void evo_udf_close_window(void *pb_v, void *handle)
+{
+    AVIOContext *pb = (AVIOContext *)pb_v;
+    win_io *w = (win_io *)handle;
+
+    if (pb) {
+        av_freep(&pb->buffer);
+        avio_context_free(&pb);
+    }
+    if (w) {
+        if (w->under)
+            avio_closep(&w->under);
+        pthread_mutex_destroy(&w->lock);
+        free(w);
+    }
 }

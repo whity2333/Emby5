@@ -6,6 +6,8 @@
  */
 #include "evo_stream_io.h"
 #include "evo_iso_probe.h"
+#include "evo_udf.h"
+#include "evo_boot_log.h"
 #include "evo_direct_mem.h"
 #include <libavutil/error.h>
 
@@ -58,6 +60,11 @@ struct evo_stream_io_ctx {
     volatile int aborted;      /* accessed atomically, including UI-triggered abort */
     int (*external_interrupt)(void *);
     void *external_opaque;
+    /* Set when the stream came out of a disc image: the window over the main
+     * title's bytes, and its handle. Owned here, released by
+     * evo_stream_io_close(). NULL for an ordinary stream. */
+    void *udf_pb;
+    void *udf_handle;
 };
 
 static _Thread_local int (*s_open_interrupt)(void *);
@@ -462,17 +469,23 @@ int evo_stream_io_open(const char *path,
     av_dict_free(&opts);
 
     if (rc < 0) {
-        evo_direct_mem_free(ctx);
         /*
-         * A disc image (.iso) is a filesystem, not a stream: avformat cannot
-         * open it and the caller only ever sees "unsupported". Probe it here,
-         * on the failure path only, so the log says what the image actually
-         * contains (ISO9660? UDF? partition? descriptor sequence?) instead of
-         * leaving a bare error code. Read-only; a stream that opens normally
-         * never reaches this.
+         * A disc image (.iso) is a UDF filesystem, not a container, so
+         * avformat rejects it with AVERROR_INVALIDDATA and the caller only
+         * ever sees "unsupported". Before giving up:
+         *
+         *   1. probe the image so the log says what it actually contains,
+         *   2. look for a BDMV/STREAM title inside it,
+         *   3. reopen a window over just that title's bytes and try again.
+         *
+         * The demuxer then reads an ordinary mpegts stream and nothing below
+         * this point knows an image was involved. Only reached when a normal
+         * open already failed, so a working stream never pays for it.
          *
          * Probed once per distinct path so a retry loop cannot spam it.
          */
+        int64_t iso_off = 0, iso_size = 0;
+
         {
             static char s_last_probed[512];
             if (path && strcmp(s_last_probed, path) != 0) {
@@ -480,6 +493,39 @@ int evo_stream_io_open(const char *path,
                 evo_iso_probe(path);
             }
         }
+
+        if (path && evo_udf_main_title(path, &iso_off, &iso_size) == 0) {
+            void *pb = NULL, *handle = NULL;
+
+            if (evo_udf_open_window(path, iso_off, iso_size, &pb, &handle) == 0) {
+                AVFormatContext *fmt2 = avformat_alloc_context();
+
+                if (fmt2) {
+                    fmt2->pb = (AVIOContext *)pb;
+                    fmt2->flags |= AVFMT_FLAG_CUSTOM_IO;
+                    fmt2->interrupt_callback.callback = sio_interrupt_cb;
+                    fmt2->interrupt_callback.opaque   = ctx;
+
+                    evo_stream_io_set_deadline(ctx, EVO_STREAM_IO_OPEN_DEADLINE_SEC);
+                    rc = avformat_open_input(&fmt2, NULL, NULL, NULL);
+                    evo_stream_io_set_deadline(ctx, 0.0);
+
+                    if (rc >= 0 && fmt2) {
+                        ctx->udf_pb     = pb;
+                        ctx->udf_handle = handle;
+                        *out_fmt_ctx = fmt2;
+                        if (out_io_ctx) *out_io_ctx = ctx;
+                        SIO_BC("P8_01f_ISO_TITLE", "opened main title from image");
+                        return 0;
+                    }
+                    /* avformat_open_input freed fmt2 on failure. */
+                    evo_boot_log("ISO: the title inside the image did not open (%d)", rc);
+                }
+                evo_udf_close_window(pb, handle);
+            }
+        }
+
+        evo_direct_mem_free(ctx);
         return rc;
     }
 
@@ -491,5 +537,10 @@ int evo_stream_io_open(const char *path,
 void evo_stream_io_close(evo_stream_io_ctx_t *ctx)
 {
     if (!ctx) return;
+    if (ctx->udf_pb || ctx->udf_handle) {
+        evo_udf_close_window(ctx->udf_pb, ctx->udf_handle);
+        ctx->udf_pb = NULL;
+        ctx->udf_handle = NULL;
+    }
     evo_direct_mem_free(ctx);
 }

@@ -31,6 +31,30 @@ extern "C" {
  */
 int evo_udf_inspect(const char *url);
 
+/*
+ * Locate the main title inside `url` without logging the whole tree.
+ * On success fills *offset (byte offset of the .m2ts inside the image) and
+ * *size (its length in bytes) and returns 0. Returns -1 when the image has no
+ * usable BDMV/STREAM entry.
+ *
+ * The title is the largest .m2ts. That is a heuristic: it is right on a plain
+ * disc and wrong on a seamless-branching one, where the feature is split
+ * across several .m2ts and only the .mpls knows the order. Reported as such.
+ */
+int evo_udf_main_title(const char *url, int64_t *offset, int64_t *size);
+
+/*
+ * Build an AVIOContext that exposes only [offset, offset+size) of `url`.
+ *
+ * This is what makes an .iso playable: the demuxer sees a normal, seekable
+ * file of the title's length, while every read is a range request into the
+ * image. Returns 0 and fills *out_pb on success; the caller owns the pair and
+ * releases it with evo_udf_close_window().
+ */
+int evo_udf_open_window(const char *url, int64_t offset, int64_t size,
+                        void **out_pb, void **out_handle);
+void evo_udf_close_window(void *pb, void *handle);
+
 #ifdef __cplusplus
 }
 #endif
