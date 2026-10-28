@@ -439,10 +439,22 @@ void update_hdr(bool playing)
 {
     static int s_want = 0;
     static bool s_refused = false;
+    static bool s_logged = false;
     const int trc = evo_agc_runtime_last_video_trc();
     const int want = (playing && (trc == 16 || trc == 18)) ? 1 : 0;
-    if (!playing)
+    /*
+     * One line per playback saying what the decoder reported. 16 is PQ, 18 is
+     * HLG; anything else (2 = unspecified is the common one) means HDR output
+     * is never requested, which looks exactly like "HDR did not turn on".
+     */
+    if (playing && !s_logged) {
+        s_logged = true;
+        evo_bt("nuvio: hdr check trc=%d (16=PQ 18=HLG, else no HDR request)", trc);
+    }
+    if (!playing) {
         s_refused = false;
+        s_logged = false;
+    }
     if (want == s_want || (want && s_refused))
         return;
     evo_bt("nuvio: hdr10 %s (trc=%d)", want ? "on" : "off", trc);

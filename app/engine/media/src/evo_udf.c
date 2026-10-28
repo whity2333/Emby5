@@ -451,9 +451,17 @@ int evo_udf_open_window(const char *url, int64_t offset, int64_t size,
         return -1;
     }
 
+    /*
+     * The demuxer decides whether byte seeking is allowed at all from this
+     * flag. Without it av_seek_frame() on mpegts is refused, the player treats
+     * the seek as failed and starts the title again from 0 - a drag of the
+     * progress bar that lands back at the beginning.
+     */
+    pb->seekable = AVIO_SEEKABLE_NORMAL;
+
     *out_pb     = pb;
     *out_handle = w;
-    evo_boot_log("UDF: window ready, %lld bytes at offset %lld",
+    evo_boot_log("UDF: window ready, %lld bytes at offset %lld (seekable)",
                  (long long)size, (long long)offset);
     return 0;
 }
