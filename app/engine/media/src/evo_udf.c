@@ -169,8 +169,11 @@ static void list_dir(udfread *udf, UDFDIR *parent, const char *name, const char 
  * Mount the image, pick the main title. `log_tree` controls how much goes to
  * the log: the playback path asks for the numbers only.
  */
+static int64_t title_duration_45k(udfread *udf, const char *clip);
+
 static int udf_walk(const char *url, int log_tree,
-                    int64_t *out_offset, int64_t *out_size)
+                    int64_t *out_offset, int64_t *out_size,
+                    int64_t *out_dur45k)
 {
     avio_input *in;
     udfread *udf;
@@ -295,6 +298,16 @@ static int udf_walk(const char *url, int log_tree,
     if (out_offset) *out_offset = (int64_t)best_lba * UDF_BLOCK_SIZE;
     if (out_size)   *out_size   = best_size;
 
+    /* The playlist has to be read before the volume is closed. */
+    if (out_dur45k) {
+        char clip[8];
+        snprintf(clip, sizeof clip, "%.5s", best_name);
+        *out_dur45k = title_duration_45k(udf, clip);
+        if (log_tree && *out_dur45k > 0)
+            evo_boot_log("UDF: title duration %.3f s (from the playlist)",
+                         (double)*out_dur45k / 45000.0);
+    }
+
     /* udfread_close() calls our close(), which frees `in`. */
     udfread_close(udf);
     return n;
@@ -370,6 +383,147 @@ static int64_t win_seek(void *opaque, int64_t off, int whence)
 }
 
 /* ------------------------------------------------------------------ */
+/* playlist (.mpls): the title's real duration                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * MPEG-TS carries no index, so av_seek_frame() on it estimates a byte
+ * position as (target / duration) * size. With no duration the estimate is
+ * always 0: the seek reports success and playback restarts at the top.
+ *
+ * The duration a Blu-ray image does have is in its playlist: every playitem
+ * has IN_time and OUT_time in 45 kHz ticks. That is what this reads.
+ */
+
+#define MPLS_MAX_BYTES (1024 * 1024)
+
+static uint32_t be32(const unsigned char *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
+}
+
+static unsigned be16(const unsigned char *p)
+{
+    return ((unsigned)p[0] << 8) | (unsigned)p[1];
+}
+
+/*
+ * Read one .mpls and return its total duration in 45 kHz ticks, or -1 when the
+ * playlist does not reference `clip` (a 5-character clip id, "00008").
+ */
+static int64_t mpls_duration_for_clip(udfread *udf, const char *path, const char *clip)
+{
+    UDFFILE *f;
+    int64_t size, total = -1;
+    unsigned char *buf;
+    uint32_t pl_start;
+    size_t got = 0;
+
+    f = udfread_file_open(udf, path);
+    if (!f)
+        return -1;
+    size = udfread_file_size(f);
+    if (size < 40 || size > MPLS_MAX_BYTES) {
+        udfread_file_close(f);
+        return -1;
+    }
+
+    buf = (unsigned char *)malloc((size_t)size);
+    if (!buf) {
+        udfread_file_close(f);
+        return -1;
+    }
+    while (got < (size_t)size) {
+        ssize_t n = udfread_file_read(f, buf + got, (size_t)size - got);
+        if (n <= 0)
+            break;
+        got += (size_t)n;
+    }
+    udfread_file_close(f);
+
+    if (got < 40 || memcmp(buf, "MPLS", 4) != 0) {
+        free(buf);
+        return -1;
+    }
+
+    pl_start = be32(buf + 8);
+    if (pl_start + 10 > got) {
+        free(buf);
+        return -1;
+    }
+
+    {
+        /* length(4) reserved(2) number_of_PlayItems(2) number_of_SubPaths(2) */
+        unsigned n_items = be16(buf + pl_start + 6);
+        size_t p = (size_t)pl_start + 10;
+        int64_t sum = 0;
+        int references_clip = 0;
+
+        for (unsigned i = 0; i < n_items && p + 22 <= got; i++) {
+            unsigned plen = be16(buf + p);
+            if (plen < 20 || p + 2 + plen > got)
+                break;
+
+            /* playitem: length(2) clip_name(5) codec(4) reserved(1)
+             *           connection_condition(1) stc_id(1) in(4) out(4) */
+            if (!memcmp(buf + p + 2, clip, 5))
+                references_clip = 1;
+
+            {
+                uint32_t in_time  = be32(buf + p + 14);
+                uint32_t out_time = be32(buf + p + 18);
+                if (out_time > in_time)
+                    sum += (int64_t)(out_time - in_time);
+            }
+            p += 2 + plen;
+        }
+
+        if (references_clip)
+            total = sum;
+    }
+
+    free(buf);
+    return total;
+}
+
+/*
+ * Pick the playlist that references `clip` and runs longest - on a disc with
+ * several cuts of the same film that is the feature, not the trailer.
+ */
+static int64_t title_duration_45k(udfread *udf, const char *clip)
+{
+    UDFDIR *bdmv = udfread_opendir(udf, "BDMV");
+    UDFDIR *pl;
+    struct udfread_dirent e;
+    int64_t best = -1;
+
+    if (!bdmv)
+        return -1;
+    pl = udfread_opendir_at(bdmv, "PLAYLIST");
+    if (!pl) {
+        udfread_closedir(bdmv);
+        return -1;
+    }
+
+    while (udfread_readdir(pl, &e)) {
+        char path[320];
+        int64_t d;
+
+        if (!e.d_name || !ends_with_ci(e.d_name, ".mpls"))
+            continue;
+        snprintf(path, sizeof path, "BDMV/PLAYLIST/%s", e.d_name);
+        d = mpls_duration_for_clip(udf, path, clip);
+        if (d > best)
+            best = d;
+    }
+
+    udfread_closedir(pl);
+    udfread_closedir(bdmv);
+    return best;
+}
+
+/* ------------------------------------------------------------------ */
 /* public                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -377,12 +531,13 @@ int evo_udf_inspect(const char *url)
 {
     if (!url || !*url)
         return -1;
-    return udf_walk(url, 1, NULL, NULL);
+    return udf_walk(url, 1, NULL, NULL, NULL);
 }
 
-int evo_udf_main_title(const char *url, int64_t *offset, int64_t *size)
+int evo_udf_main_title(const char *url, int64_t *offset, int64_t *size,
+                       int64_t *duration_45k)
 {
-    int64_t off = 0, len = 0;
+    int64_t off = 0, len = 0, dur = -1;
 
     if (!url || !*url || !offset || !size)
         return -1;
@@ -391,11 +546,13 @@ int evo_udf_main_title(const char *url, int64_t *offset, int64_t *size)
      * running when several local builds are floating around. */
     evo_boot_log("ISO: looking for a BDMV title (iso-play/2)");
 
-    if (udf_walk(url, 1, &off, &len) <= 0 || len <= 0)
+    if (udf_walk(url, 1, &off, &len, &dur) <= 0 || len <= 0)
         return -1;
 
     *offset = off;
     *size   = len;
+    if (duration_45k)
+        *duration_45k = dur;
     return 0;
 }
 

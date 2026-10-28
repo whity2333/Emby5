@@ -37,11 +37,17 @@ int evo_udf_inspect(const char *url);
  * *size (its length in bytes) and returns 0. Returns -1 when the image has no
  * usable BDMV/STREAM entry.
  *
+ * *duration_45k receives the title's length in 45 kHz ticks, read from the
+ * playlist that references this clip, or -1 when no playlist matched. The
+ * demuxer needs it: mpegts estimates a seek position from the duration, and
+ * with none every seek lands at byte 0.
+ *
  * The title is the largest .m2ts. That is a heuristic: it is right on a plain
  * disc and wrong on a seamless-branching one, where the feature is split
  * across several .m2ts and only the .mpls knows the order. Reported as such.
  */
-int evo_udf_main_title(const char *url, int64_t *offset, int64_t *size);
+int evo_udf_main_title(const char *url, int64_t *offset, int64_t *size,
+                       int64_t *duration_45k);
 
 /*
  * Build an AVIOContext that exposes only [offset, offset+size) of `url`.

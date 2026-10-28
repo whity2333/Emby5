@@ -10,6 +10,7 @@
 #include "evo_boot_log.h"
 #include "evo_direct_mem.h"
 #include <libavutil/error.h>
+#include <libavutil/mathematics.h>
 
 #ifdef EVO_APP_MODULE
 extern void pp_stage_bc(const char *stage_id, const char *detail);
@@ -65,6 +66,10 @@ struct evo_stream_io_ctx {
      * evo_stream_io_close(). NULL for an ordinary stream. */
     void *udf_pb;
     void *udf_handle;
+    /* Title length in 45 kHz ticks, from the image's playlist. Applied to the
+     * demuxer in evo_stream_io_probe(): mpegts estimates a seek position from
+     * the duration, and with none every seek lands at byte 0. */
+    int64_t udf_duration_45k;
 };
 
 static _Thread_local int (*s_open_interrupt)(void *);
@@ -105,6 +110,22 @@ int evo_stream_io_probe(evo_stream_io_ctx_t *ctx, AVFormatContext *fmt, double s
      */
     if (ctx && ctx->udf_pb)
         evo_udf_window_enable_seek(ctx->udf_pb);
+    /*
+     * Give the demuxer the length the playlist states. mpegts has no index and
+     * seeks by estimating a byte position from (target / duration) * size; with
+     * duration 0 the estimate is always 0, so every seek reported success and
+     * restarted the title. Only fills a duration that is still missing.
+     */
+    if (ctx && ctx->udf_duration_45k > 0 && fmt->duration <= 0) {
+        fmt->duration = av_rescale(ctx->udf_duration_45k, AV_TIME_BASE, 45000);
+        for (unsigned i = 0; i < fmt->nb_streams; i++) {
+            AVStream *st = fmt->streams[i];
+            if (st && st->duration <= 0 && st->time_base.num > 0)
+                st->duration = av_rescale_q(fmt->duration, AV_TIME_BASE_Q, st->time_base);
+        }
+        evo_boot_log("ISO: demuxer duration set to %.3f s from the playlist",
+                     (double)fmt->duration / AV_TIME_BASE);
+    }
     /* find_stream_info may return success after an interrupted read. */
     return evo_stream_io_is_aborted(ctx) ? AVERROR_EXIT : rc;
 }
@@ -492,7 +513,7 @@ int evo_stream_io_open(const char *path,
          *
          * Probed once per distinct path so a retry loop cannot spam it.
          */
-        int64_t iso_off = 0, iso_size = 0;
+        int64_t iso_off = 0, iso_size = 0, iso_dur45k = -1;
 
         {
             static char s_last_probed[512];
@@ -502,7 +523,7 @@ int evo_stream_io_open(const char *path,
             }
         }
 
-        if (path && evo_udf_main_title(path, &iso_off, &iso_size) == 0) {
+        if (path && evo_udf_main_title(path, &iso_off, &iso_size, &iso_dur45k) == 0) {
             void *pb = NULL, *handle = NULL;
 
             if (evo_udf_open_window(path, iso_off, iso_size, &pb, &handle) == 0) {
@@ -521,6 +542,7 @@ int evo_stream_io_open(const char *path,
                     if (rc >= 0 && fmt2) {
                         ctx->udf_pb     = pb;
                         ctx->udf_handle = handle;
+                        ctx->udf_duration_45k = iso_dur45k;
                         *out_fmt_ctx = fmt2;
                         if (out_io_ctx) *out_io_ctx = ctx;
                         SIO_BC("P8_01f_ISO_TITLE", "opened main title from image");
