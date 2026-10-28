@@ -661,6 +661,18 @@ static int slot_bringup(struct dec_slot *s, const nat_codec_desc *d,
     s->input_pool   = (size_t)INPUT_SLOT_BYTES * PIPELINE_BUFFER_COUNT;
     s->frame_pool   = s->frame_size * frame_slot_count();
     if (s->frame_size == 0) return -1;
+    /*
+     * What this bring-up is about to ask for, per region. The direct-memory
+     * allocator hands out one physically contiguous run per call, so what
+     * matters is not the total but whether each region fits the largest free
+     * run - which is why a 4K bring-up can fail at alloc(frame) after gpu,
+     * cpu_gpu and input all succeeded.
+     */
+    note("EVO vdec native: %s %dx%d needs gpu=%zuKB cpu_gpu=%zuKB input=%zuKB "
+         "frame=%zuKB x %u = %zuKB",
+         d->tag, w, h, s->gpu_size >> 10, s->cpu_gpu_size >> 10,
+         s->input_pool >> 10, s->frame_size >> 10, frame_slot_count(),
+         s->frame_pool >> 10);
     mem.gpu_size = s->gpu_size;
     if (s->cpu_gpu_size) mem.cpu_gpu_size = s->cpu_gpu_size;
 
