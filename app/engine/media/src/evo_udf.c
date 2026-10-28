@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <stdint.h>
 
 /* How many entries of each kind to log before summarising the rest. */
@@ -46,11 +47,27 @@
 /* udfread block input backed by avio                                  */
 /* ------------------------------------------------------------------ */
 
+/*
+ * How much of the image to pull in one sequential read before parsing.
+ *
+ * A Blu-ray keeps all of its metadata at the front: the anchor at sector 256,
+ * the volume descriptor sequence at 32, the partition at 288, and the whole
+ * BDMV tree - directory records, CLIPINF, and every playlist - before the
+ * first stream file. On this disc that is sectors 288-696, under 1.5 MB.
+ *
+ * Reading it once sequentially replaces a dozen small range requests, each of
+ * which pays a full round trip through whatever proxy fronts the image. That
+ * round-trip count, not bandwidth, is what made startup slow.
+ */
+#define AI_PRELOAD_BYTES (8 * 1024 * 1024)
+
 typedef struct {
     udfread_block_input bi;      /* must be first: the callbacks cast back */
     AVIOContext        *io;
     int64_t             size_bytes;
     pthread_mutex_t     lock;    /* avio is not thread-safe; reads may race */
+    unsigned char      *pre;     /* the first AI_PRELOAD_BYTES, or as much as read */
+    int64_t             pre_len;
 } avio_input;
 
 static int ai_read(udfread_block_input *in, uint32_t lba, void *buf,
@@ -65,6 +82,12 @@ static int ai_read(udfread_block_input *in, uint32_t lba, void *buf,
 
     if (!self->io || want == 0)
         return 0;
+
+    /* Inside the preloaded head: no network at all. */
+    if (self->pre && off >= 0 && off + (int64_t)want <= self->pre_len) {
+        memcpy(buf, self->pre + off, want);
+        return (int)nblocks;
+    }
 
     pthread_mutex_lock(&self->lock);
     if (avio_seek(self->io, off, SEEK_SET) >= 0) {
@@ -95,6 +118,7 @@ static int ai_close(udfread_block_input *in)
 
     if (self->io)
         avio_closep(&self->io);
+    free(self->pre);
     pthread_mutex_destroy(&self->lock);
     free(self);
     return 0;
@@ -197,6 +221,31 @@ static int udf_walk(const char *url, int log_tree, evo_udf_title *out_title)
 
     in->size_bytes = avio_size(in->io);
     pthread_mutex_init(&in->lock, NULL);
+
+    /*
+     * One sequential read of the head, then the whole walk is served from
+     * memory. avio_read() pulls through the protocol's buffer, so this is a
+     * single request rather than one per descriptor.
+     */
+    {
+        int64_t want = in->size_bytes > 0 && in->size_bytes < AI_PRELOAD_BYTES
+                           ? in->size_bytes : AI_PRELOAD_BYTES;
+        int64_t t0 = (int64_t)time(NULL);
+
+        in->pre = (unsigned char *)malloc((size_t)want);
+        if (in->pre) {
+            int64_t got = 0;
+            while (got < want) {
+                int n = avio_read(in->io, in->pre + got, (int)(want - got));
+                if (n <= 0)
+                    break;
+                got += n;
+            }
+            in->pre_len = got;
+            evo_boot_log("UDF: preloaded %lld KB of the image head in %lld s",
+                         (long long)(got / 1024), (long long)((int64_t)time(NULL) - t0));
+        }
+    }
     in->bi.read  = ai_read;
     in->bi.size  = ai_size;
     in->bi.close = ai_close;
