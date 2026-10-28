@@ -960,6 +960,21 @@ extern "C" void nuvio_player_run(const char *json)
         if (nuvio_bridge_get("/api/debug/vdec-conf", &conf) == 200 && conf)
             std::snprintf(nuvio_vdec_conf, sizeof nuvio_vdec_conf, "%s", conf);
         free(conf);
+        /*
+         * Fallback for a release build: the bridge endpoint only exists in LAN
+         * debug payloads, so a vdec.conf dropped next to the app's data is the
+         * only way to reach the tunables without a rebuild. Same format, one
+         * key=value per line (see evo_vdec_native.c).
+         */
+        if (!nuvio_vdec_conf[0]) {
+            FILE *vfp = std::fopen("/data/Emby5/vdec.conf", "r");
+            if (vfp) {
+                size_t n = std::fread(nuvio_vdec_conf, 1, sizeof nuvio_vdec_conf - 1, vfp);
+                std::fclose(vfp);
+                nuvio_vdec_conf[n] = 0;
+                evo_bt("nuvio: vdec.conf loaded from /data/Emby5 (%zu bytes)", n);
+            }
+        }
     }
         const int session = ++s_session;
     s_audio_langs = s.req.prefs.audio_langs;
