@@ -97,6 +97,14 @@ int evo_stream_io_probe(evo_stream_io_ctx_t *ctx, AVFormatContext *fmt, double s
     evo_stream_io_set_deadline(ctx, seconds);
     const int rc = avformat_find_stream_info(fmt, NULL);
     evo_stream_io_set_deadline(ctx, 0.0);
+    /*
+     * A disc-image window is non-seekable while avformat probes, so the probe
+     * cannot wander off to the end of the image for a duration estimate. Now
+     * that the probe is over, let it seek: without this every av_seek_frame()
+     * is refused and the player restarts the title from 0.
+     */
+    if (ctx && ctx->udf_pb)
+        evo_udf_window_enable_seek(ctx->udf_pb);
     /* find_stream_info may return success after an interrupted read. */
     return evo_stream_io_is_aborted(ctx) ? AVERROR_EXIT : rc;
 }

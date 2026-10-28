@@ -452,18 +452,39 @@ int evo_udf_open_window(const char *url, int64_t offset, int64_t size,
     }
 
     /*
-     * The demuxer decides whether byte seeking is allowed at all from this
-     * flag. Without it av_seek_frame() on mpegts is refused, the player treats
-     * the seek as failed and starts the title again from 0 - a drag of the
-     * progress bar that lands back at the beginning.
+     * Deliberately NOT seekable yet.
+     *
+     * Setting AVIO_SEEKABLE_NORMAL here lets avformat probe by seeking - to the
+     * end for a duration estimate, and back - and every seek is a fresh range
+     * request through whatever proxy fronts the image. On a cloud-backed
+     * 87 GB image that turned an 11 s open into a 46 s one.
+     *
+     * evo_udf_window_enable_seek() turns it on once find_stream_info has
+     * finished, which is when the player needs it and the demuxer no longer
+     * probes.
      */
-    pb->seekable = AVIO_SEEKABLE_NORMAL;
-
     *out_pb     = pb;
     *out_handle = w;
-    evo_boot_log("UDF: window ready, %lld bytes at offset %lld (seekable)",
+    evo_boot_log("UDF: window ready, %lld bytes at offset %lld",
                  (long long)size, (long long)offset);
     return 0;
+}
+
+void evo_udf_window_enable_seek(void *pb_v)
+{
+    AVIOContext *pb = (AVIOContext *)pb_v;
+
+    if (!pb)
+        return;
+    if (pb->seekable & AVIO_SEEKABLE_NORMAL)
+        return;
+    /*
+     * The demuxer decides whether byte seeking is allowed at all from this
+     * flag. Without it av_seek_frame() on mpegts is refused, and the player
+     * treats a refused seek as "start the title again from 0".
+     */
+    pb->seekable = AVIO_SEEKABLE_NORMAL;
+    evo_boot_log("UDF: window is seekable now");
 }
 
 void evo_udf_close_window(void *pb_v, void *handle)

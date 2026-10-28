@@ -55,6 +55,16 @@ int evo_udf_open_window(const char *url, int64_t offset, int64_t size,
                         void **out_pb, void **out_handle);
 void evo_udf_close_window(void *pb, void *handle);
 
+/*
+ * Allow byte seeking in a window.
+ *
+ * A window starts non-seekable on purpose: while avformat probes, a seekable
+ * stream invites duration estimates that seek to the end of the image, and each
+ * of those is a range request through the proxy. Call this once the probe is
+ * done - then seeking works and playback can jump.
+ */
+void evo_udf_window_enable_seek(void *pb);
+
 #ifdef __cplusplus
 }
 #endif

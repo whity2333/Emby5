@@ -308,7 +308,16 @@ bool start_job(OpenJob &j)
 {
     j.done = false;
     j.cancel = false;
-    j.deadline = now_s() + 45.0;
+    /*
+     * How long an open may take before the watchdog cancels it.
+     *
+     * 45 s is right for a normal stream. A disc image is not normal: the image
+     * has to be opened, its UDF filesystem walked to find the title, and the
+     * title's first byte reached - three range requests through whatever proxy
+     * sits in front of the file. On a cloud-backed 87 GB image that measured
+     * 11 s on a good run and 46 s on a slow one, so 45 s left no margin.
+     */
+    j.deadline = now_s() + 90.0;
     j.ok = false;
     j.running = true;
     if (evo_thread_create(&j.thread, open_thread, &j) != 0) {
