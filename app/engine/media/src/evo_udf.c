@@ -445,7 +445,13 @@ static void collect_track_langs(const unsigned char *b, size_t n, evo_udf_title 
             size_t q = i - (size_t)back - 1;
             unsigned pid = ((unsigned)b[q] << 8) | (unsigned)b[q + 1];
 
-            if (pid < 0x0100 || pid > 0x1FFF)
+            /*
+             * Blu-ray elementary streams sit at 0x1000-0x1FFF. The wider
+             * 0x0100-0x1FFF range also matched the pair just before the code -
+             * "05 83" is a stream-entry length and codec, and 0x0583 reads as
+             * a plausible PID, which is why every track came back with 1424.
+             */
+            if (pid < 0x1000 || pid > 0x1FFF)
                 continue;
             if (out->ntracks >= EVO_UDF_MAX_TRACKS)
                 return;
