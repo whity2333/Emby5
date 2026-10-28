@@ -550,21 +550,20 @@ int evo_stream_io_open(const char *path,
         /*
          * A disc image (.iso) is a UDF filesystem, not a container, so
          * avformat rejects it with AVERROR_INVALIDDATA and the caller only
-         * ever sees "unsupported". Before giving up:
+         * ever sees "unsupported". Look for a BDMV/STREAM title inside it and,
+         * if there is one, reopen a window over just that title's bytes.
          *
-         *   1. probe the image so the log says what it actually contains,
-         *   2. look for a BDMV/STREAM title inside it,
-         *   3. reopen a window over just that title's bytes and try again.
-         *
-         * The demuxer then reads an ordinary mpegts stream and nothing below
-         * this point knows an image was involved. Only reached when a normal
-         * open already failed, so a working stream never pays for it.
-         *
-         * Probed once per distinct path so a retry loop cannot spam it.
+         * The diagnostic probe runs only when nothing playable was found: it
+         * costs a whole extra connection, and on a cloud-backed image that is
+         * seconds the viewer would otherwise wait for.
          */
         evo_udf_title iso;
+        int have_title;
 
-        {
+        memset(&iso, 0, sizeof iso);
+        have_title = (path && evo_udf_main_title(path, &iso) == 0);
+
+        if (!have_title) {
             static char s_last_probed[512];
             if (path && strcmp(s_last_probed, path) != 0) {
                 snprintf(s_last_probed, sizeof s_last_probed, "%s", path);
@@ -572,9 +571,7 @@ int evo_stream_io_open(const char *path,
             }
         }
 
-        memset(&iso, 0, sizeof iso);
-
-        if (path && evo_udf_main_title(path, &iso) == 0) {
+        if (have_title) {
             void *pb = NULL, *handle = NULL;
 
             if (evo_udf_open_window(path, iso.offset, iso.size, &pb, &handle) == 0) {
@@ -591,9 +588,25 @@ int evo_stream_io_open(const char *path,
                     evo_stream_io_set_deadline(ctx, 0.0);
 
                     if (rc >= 0 && fmt2) {
+                        /*
+                         * Set the length before avformat_find_stream_info().
+                         * With no duration mpegts estimates one by seeking to
+                         * the end of the image and back - two range requests
+                         * into an 87 GB file, seconds of startup, and nothing
+                         * we need since the playlist already states it.
+                         */
+                        if (iso.duration_45k > 0) {
+                            fmt2->duration = av_rescale(iso.duration_45k, AV_TIME_BASE, 45000);
+                            for (unsigned i = 0; i < fmt2->nb_streams; i++) {
+                                AVStream *st = fmt2->streams[i];
+                                if (st && st->duration <= 0 && st->time_base.num > 0)
+                                    st->duration = av_rescale_q(fmt2->duration, AV_TIME_BASE_Q,
+                                                                st->time_base);
+                            }
+                        }
                         ctx->udf_pb     = pb;
                         ctx->udf_handle = handle;
-                        ctx->udf_title = iso;
+                        ctx->udf_title  = iso;
                         *out_fmt_ctx = fmt2;
                         if (out_io_ctx) *out_io_ctx = ctx;
                         SIO_BC("P8_01f_ISO_TITLE", "opened main title from image");

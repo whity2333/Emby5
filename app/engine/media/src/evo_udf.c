@@ -654,6 +654,76 @@ static void title_from_playlists(udfread *udf, const char *clip, evo_udf_title *
 }
 
 /* ------------------------------------------------------------------ */
+/* result cache                                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Walking the image costs a connection, a descriptor-tree pass and one range
+ * request per playlist - around 20 s on a cloud-backed disc. The URL changes
+ * every session (playSessionId), but everything up to the query string is
+ * stable per item, so cache on that: a second play of the same title skips
+ * the walk entirely.
+ */
+#define UDF_CACHE_MAX 8
+
+typedef struct {
+    char          key[256];
+    evo_udf_title title;
+    int           valid;
+} udf_cache_entry;
+
+static udf_cache_entry s_cache[UDF_CACHE_MAX];
+static pthread_mutex_t s_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void cache_key(const char *url, char *out, size_t cap)
+{
+    size_t n = 0;
+
+    while (url[n] && url[n] != '?' && n + 1 < cap) {
+        out[n] = url[n];
+        n++;
+    }
+    out[n] = 0;
+}
+
+static int cache_get(const char *url, evo_udf_title *out)
+{
+    char key[256];
+    int hit = 0;
+
+    cache_key(url, key, sizeof key);
+    pthread_mutex_lock(&s_cache_lock);
+    for (int i = 0; i < UDF_CACHE_MAX; i++) {
+        if (s_cache[i].valid && !strcmp(s_cache[i].key, key)) {
+            *out = s_cache[i].title;
+            hit = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_cache_lock);
+    return hit;
+}
+
+static void cache_put(const char *url, const evo_udf_title *t)
+{
+    char key[256];
+    int slot = -1;
+
+    cache_key(url, key, sizeof key);
+    pthread_mutex_lock(&s_cache_lock);
+    for (int i = 0; i < UDF_CACHE_MAX; i++) {
+        if (s_cache[i].valid && !strcmp(s_cache[i].key, key)) { slot = i; break; }
+        if (!s_cache[i].valid && slot < 0) slot = i;
+    }
+    if (slot < 0)
+        slot = 0;   /* replace the first */
+    snprintf(s_cache[slot].key, sizeof s_cache[slot].key, "%s", key);
+    s_cache[slot].title = *t;
+    s_cache[slot].valid = 1;
+    pthread_mutex_unlock(&s_cache_lock);
+}
+
+/* ------------------------------------------------------------------ */
 /* window registry: lets the demuxer recognise a disc-image stream     */
 /* ------------------------------------------------------------------ */
 
@@ -725,10 +795,18 @@ int evo_udf_main_title(const char *url, evo_udf_title *out)
 
     /* Build marker: the fastest way to tell from a log which binary is
      * running when several local builds are floating around. */
-    evo_boot_log("ISO: looking for a BDMV title (iso-play/3)");
+    evo_boot_log("ISO: looking for a BDMV title (iso-play/4)");
+
+    if (cache_get(url, out)) {
+        evo_boot_log("ISO: cached title at offset %lld, %lld bytes, %.1f s",
+                     (long long)out->offset, (long long)out->size,
+                     out->duration_45k > 0 ? (double)out->duration_45k / 45000.0 : 0.0);
+        return 0;
+    }
 
     if (udf_walk(url, 1, out) <= 0 || out->size <= 0)
         return -1;
+    cache_put(url, out);
     return 0;
 }
 
