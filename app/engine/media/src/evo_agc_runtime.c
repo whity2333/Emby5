@@ -2722,6 +2722,15 @@ int evo_agc_runtime_set_hdr_output(int enable)
     if (rc != 0) {
         evo_boot_log("agc hdr: display refused the %s attribute - unchanged",
                      enable ? "HDR10" : "SDR");
+        /*
+         * The common cause is the output mode, not the content: 4K at 120 Hz
+         * plus HDR needs HDMI 2.1 bandwidth, and on an HDMI 2.0 link the
+         * console has to drop one of them - it drops HDR, and the refusal
+         * looks exactly like "HDR did not turn on". Say so in the log.
+         */
+        if (enable && evo_agc_runtime_is_120hz())
+            evo_boot_log("agc hdr: output is 120 Hz - 4K120 + HDR needs HDMI 2.1; "
+                         "set the refresh rate to 60 Hz to allow HDR");
         evo_boot_log_flush();
         return -1;
     }
