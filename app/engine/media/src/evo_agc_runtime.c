@@ -152,9 +152,6 @@ typedef char evo_tile_dims_must_be_pow2[
  */
 #define EVO_AGC_VIDEO_FORMAT_HDR UINT64_C(0x8100070400000000)
 
-/* Defined below; the register path needs it long before then. */
-static uint64_t hdr_format_effective(void);
-
 /* Platform declarations */
 int32_t sceKernelAllocateDirectMemory(int64_t search_start, int64_t search_end,
                                       size_t bytes, size_t alignment,
@@ -222,10 +219,6 @@ typedef struct evo_agc_device {
     int                     width;
     int                     height;
     int                     is_hdr;          /* scanout registered HDR10 right now */
-    /* The 10-bit scanout format this console actually accepted. Zero means the
-     * documented value; set_hdr_output() probes alternatives when it is
-     * refused and keeps whichever worked. */
-    uint64_t                hdr_fmt;
     int                     display_is_hdr;
     int                     last_video_trc;  /* -1 none yet, else the frame's color_trc */
     int                     display_dynamic_range;
@@ -1508,7 +1501,7 @@ int evo_agc_runtime_init(int width, int height, int hdr)
     evo_video_attribute_t attr;
     memset(&attr, 0, sizeof(attr));
 
-    uint64_t vfmt = g_agc_dev.is_hdr ? hdr_format_effective() : EVO_AGC_VIDEO_FORMAT_SDR;
+    uint64_t vfmt = g_agc_dev.is_hdr ? EVO_AGC_VIDEO_FORMAT_HDR : EVO_AGC_VIDEO_FORMAT_SDR;
     sceVideoOutSetBufferAttribute2(&attr, vfmt, 0,
                                    (uint32_t)g_agc_dev.width, (uint32_t)g_agc_dev.height,
                                    0, 0, 0);
@@ -2685,20 +2678,6 @@ static void agc_scanout_set_10bit(int ten_bit)
 int32_t sceVideoOutSubmitChangeBufferAttribute2(int32_t handle, int32_t set_index,
                                                 const void *attribute, const void *option);
 
-/*
- * The 10-bit scanout format to use.
- *
- * EVO_AGC_VIDEO_FORMAT_HDR comes from a clean-room SDK, and the encoding is
- * not the same on every firmware: on 12.40 the documented Bgr10A2Bt2100Pq
- * value is refused with 0x80290003 (invalid pixel format) while the SDR value
- * is accepted, so HDR never turns on. set_hdr_output() probes the other
- * encodings the same SDK lists and remembers the one this console took.
- */
-static uint64_t hdr_format_effective(void)
-{
-    return g_agc_dev.hdr_fmt ? g_agc_dev.hdr_fmt : EVO_AGC_VIDEO_FORMAT_HDR;
-}
-
 int evo_agc_runtime_set_hdr_output(int enable)
 {
     enable = enable ? 1 : 0;
@@ -2715,7 +2694,7 @@ int evo_agc_runtime_set_hdr_output(int enable)
         return -1;
     }
 
-    const uint64_t vfmt = enable ? hdr_format_effective() : EVO_AGC_VIDEO_FORMAT_SDR;
+    const uint64_t vfmt = enable ? EVO_AGC_VIDEO_FORMAT_HDR : EVO_AGC_VIDEO_FORMAT_SDR;
     evo_boot_log("agc hdr: switching scanout to %s (fmt=%#llx)",
                  enable ? "HDR10 Bgr10A2Bt2100Pq" : "SDR Bgra8",
                  (unsigned long long)vfmt);
@@ -2740,70 +2719,6 @@ int evo_agc_runtime_set_hdr_output(int enable)
                                    0, 0, 0);
     int32_t rc = sceVideoOutSubmitChangeBufferAttribute2(g_agc_dev.video_handle, 0, &attr, NULL);
     evo_boot_log("agc hdr: SubmitChangeBufferAttribute2 rc=%d (0x%08x)", rc, (unsigned)rc);
-
-    if (rc != 0 && enable) {
-        /*
-         * Probe the other 10-bit encodings the SDK lists. A refusal here
-         * changes nothing (the call is applied at the next flip), so trying
-         * several is safe; the accepted one is remembered for every later
-         * register.
-         */
-        /*
-         * Only BGR-ordered candidates. The scanout is written BGR (the GPU
-         * uses COMP_SWAP=ALT), so an RGB-ordered format would be accepted by
-         * the console and then show swapped red and blue - or nothing - and,
-         * worse, it would be remembered and used for every later register.
-         * A wrong-colour HDR is not an improvement over SDR.
-         */
-        static const struct { uint64_t fmt; const char *name; } alt[] = {
-            { UINT64_C(0x8100000000000007), "A2B10G10R10" },
-            { UINT64_C(0x8100000000000000), "Bgr10A2" },
-        };
-        for (unsigned k = 0; k < sizeof alt / sizeof alt[0]; k++) {
-            evo_video_attribute_t a2;
-            int32_t r2;
-
-            memset(&a2, 0, sizeof a2);
-            sceVideoOutSetBufferAttribute2(&a2, alt[k].fmt, 0,
-                                           (uint32_t)g_agc_dev.width,
-                                           (uint32_t)g_agc_dev.height, 0, 0, 0);
-            r2 = sceVideoOutSubmitChangeBufferAttribute2(g_agc_dev.video_handle, 0, &a2, NULL);
-            evo_boot_log("agc hdr: alt %-18s fmt=%#llx rc=%d (0x%08x)",
-                         alt[k].name, (unsigned long long)alt[k].fmt, r2, (unsigned)r2);
-            if (r2 == 0) {
-                /*
-                 * Accepted is not the same as working: confirm the output
-                 * actually reports HDR before keeping this format. If it does
-                 * not, put the SDR attribute back and treat HDR as refused -
-                 * a format the console takes but the display does not honour
-                 * would leave the screen wrong for the whole session.
-                 */
-                evo_vo_output_status chk;
-                memset(&chk, 0, sizeof chk);
-                if (sceVideoOutGetOutputStatus(g_agc_dev.video_handle, &chk) == 0 &&
-                    chk.dynamic_range != 2) {
-                    evo_boot_log("agc hdr: alt %s accepted but output is still "
-                                 "dynamic_range=%u - reverting to SDR",
-                                 alt[k].name, chk.dynamic_range);
-                    {
-                        evo_video_attribute_t sdr;
-                        memset(&sdr, 0, sizeof sdr);
-                        sceVideoOutSetBufferAttribute2(&sdr, EVO_AGC_VIDEO_FORMAT_SDR, 0,
-                                                       (uint32_t)g_agc_dev.width,
-                                                       (uint32_t)g_agc_dev.height, 0, 0, 0);
-                        sceVideoOutSubmitChangeBufferAttribute2(g_agc_dev.video_handle,
-                                                                0, &sdr, NULL);
-                    }
-                    rc = -1;
-                    break;
-                }
-                g_agc_dev.hdr_fmt = alt[k].fmt;
-                rc = 0;
-                break;
-            }
-        }
-        evo_boot_log_flush();
-    }
 
     if (rc != 0) {
         evo_boot_log("agc hdr: display refused the %s attribute - unchanged",
