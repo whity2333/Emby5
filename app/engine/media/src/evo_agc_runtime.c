@@ -78,8 +78,8 @@ typedef char evo_tile_dims_must_be_pow2[
 #define EVO_AGC_MAX_RENDER_W 3840
 #define EVO_AGC_MAX_RENDER_H 2160
 
-#define EVO_AGC_SCANOUT_STRIDE      UINT64_C(0x04000000) /* 64 MB per scanout buffer */
-#define EVO_AGC_SCANOUT_TOTAL       UINT64_C(0x08000000) /* 128 MB for 2 buffers */
+#define EVO_AGC_SCANOUT_STRIDE      UINT64_C(0x04800000) /* 72 MB per scanout buffer */
+#define EVO_AGC_SCANOUT_TOTAL       UINT64_C(0x09000000) /* 144 MB for 2 buffers */
 /* 128 MB = ~42.7 MB per frame slot (EVO_AGC_FRAME_SLOTS = 3). At 64 MB a slot
  * was 21.3 MB, and a software-decoded 4K 10-bit planar frame stages 16.6 MB of
  * Y plus 8.3 MB of interleaved RG16 chroma = 24.9 MB - so every such frame
@@ -167,9 +167,32 @@ typedef char evo_tile_dims_must_be_pow2[
 static int s_scanout_rgb;
 /* -1 = derive from s_scanout_rgb, 0/1 = force. display.conf scanout_swap=. */
 static int s_scanout_swap = -1;
+/*
+ * The exact token that ended up registered. The format probe can settle on a
+ * different one than scanout_format() would pick - on 12.40 the only PQ
+ * encoding VideoOut will take is the 16-bit float one - and every later
+ * decision (bytes per pixel, CB_COLOR0_INFO, the clear value, the runtime
+ * switch) has to follow what is actually on screen, not what was asked for.
+ */
+static uint64_t s_scanout_fmt_used;
+
+/* Rgba16FloatForBt2100Pq: 8 bytes per pixel, float CB format. */
+#define EVO_AGC_VIDEO_FORMAT_HDR_16F UINT64_C(0xC001070722000000)
+
+static int scanout_is_16f(void)
+{
+    return s_scanout_fmt_used == EVO_AGC_VIDEO_FORMAT_HDR_16F;
+}
+
+static uint32_t scanout_bpp(void)
+{
+    return scanout_is_16f() ? 8u : 4u;
+}
 
 static uint64_t scanout_format(int hdr)
 {
+    if (hdr && s_scanout_fmt_used)
+        return s_scanout_fmt_used;
     if (s_scanout_rgb)
         return hdr ? EVO_AGC_VIDEO_FORMAT_HDR_RGB : EVO_AGC_VIDEO_FORMAT_SDR_RGB;
     return hdr ? EVO_AGC_VIDEO_FORMAT_HDR : EVO_AGC_VIDEO_FORMAT_SDR;
@@ -182,9 +205,12 @@ static int scanout_comp_swap_alt(void)
     return s_scanout_rgb ? 0 : 1;
 }
 
-/* Retypes CB_COLOR0_INFO between COLOR_8_8_8_8 and COLOR_2_10_10_10. Defined
- * with the runtime HDR switch, needed by the HDR bring-up in init() too. */
-static void agc_scanout_set_10bit(int ten_bit);
+/* Retypes CB_COLOR0_INFO to match whatever scanout format is registered.
+ * Defined with the runtime HDR switch, needed by the HDR bring-up in init(). */
+static void agc_scanout_set_cb_format(int hdr);
+/* Black in whatever the scanout holds. Defined next to it, used by the frame
+ * clear and the letterbox fills above that point. */
+static uint32_t scanout_clear_value(uint32_t sdr_clear);
 
 /*
  * /data/Emby5/display.conf tunables for the scanout retype, read once at init.
@@ -290,6 +316,7 @@ typedef struct evo_agc_device {
     int                     width;
     int                     height;
     int                     is_hdr;          /* scanout registered HDR10 right now */
+    int                     hdr_status_logged; /* one-shot post-flip output probe */
     int                     display_is_hdr;
     int                     last_video_trc;  /* -1 none yet, else the frame's color_trc */
     int                     display_dynamic_range;
@@ -622,7 +649,7 @@ static size_t scanout_tiled_bytes(void)
 {
     const size_t rows = ((size_t)g_agc_dev.height + PS5_TILE_HEIGHT - 1) &
                         ~(size_t)(PS5_TILE_HEIGHT - 1);
-    size_t bytes = rows * (size_t)g_agc_dev.width * 4u;
+    size_t bytes = rows * (size_t)g_agc_dev.width * (size_t)scanout_bpp();
     if (bytes > (size_t)EVO_AGC_SCANOUT_STRIDE)
         bytes = (size_t)EVO_AGC_SCANOUT_STRIDE;
     return bytes;
@@ -1173,16 +1200,21 @@ typedef struct {
 } agc_fmt_cand;
 
 static const agc_fmt_cand k_scanout_candidates[] = {
+    /*
+     * The only PQ encoding 12.40 will take: Rgba16FloatForBt2100Pq. Both
+     * 10:10:10:2 PQ tokens are refused with INVALID_PIXEL_FORMAT at every
+     * size and with any option, while this one registers at 4K and 1080p -
+     * so the working space is reachable and it is the 10-bit encodings this
+     * firmware does not have. First in the list because it is the one that
+     * works.
+     */
+    { UINT64_C(0xC001070722000000), 1, "Rgba16FloatBt2100Pq", 1 },
     { UINT64_C(0x8100070422000000), 1, "Rgb10A2Bt2100Pq", 1 },
     { UINT64_C(0x8100070400000000), 0, "Bgr10A2Bt2100Pq", 1 },
     { UINT64_C(0x8100000022000000), 1, "Rgb10A2Srgb",    0 },
     { UINT64_C(0x8100000000000000), 0, "Bgr10A2Srgb",    0 },
     { UINT64_C(0x8100000622000000), 1, "Rgb10A2",        0 },
     { UINT64_C(0x8100000600000000), 0, "Bgr10A2",        0 },
-    /* Diagnostic only: same PQ marker as the two at the top, so it is expected
-     * to be refused the same way. If it registers, the working space is
-     * reachable and the 10:10:10:2 encodings are what this firmware dislikes. */
-    { UINT64_C(0xC001070722000000), 1, "Rgba16FloatBt2100Pq", 0 },
 };
 
 /* StrictColorimetry is VideoOutBufferAttributeOption bit 3. */
@@ -1203,8 +1235,11 @@ static int agc_scanout_probe_formats(void *agc_defaults, evo_video_buffer_t *buf
         for (unsigned o = 0; o < sizeof k_scanout_options / sizeof k_scanout_options[0]; ++o) {
             const uint64_t opt = k_scanout_options[o];
             /* Re-pair the colour targets for this candidate: RGB stores
-             * R,G,B,A (COMP_SWAP=STD), BGR stores B,G,R,A (ALT). */
+             * R,G,B,A (COMP_SWAP=STD), BGR stores B,G,R,A (ALT). Setting the
+             * "used" token first is what makes the CB format and the bytes per
+             * pixel follow the candidate rather than the previous one. */
             s_scanout_rgb = c->rgb;
+            s_scanout_fmt_used = c->fmt;
             if (setup_color_target(g_agc_dev.gpu_regs->color_targets[0], agc_defaults,
                                    g_agc_dev.scanout_buffers[0], w, h,
                                    scanout_comp_swap_alt()) != 0 ||
@@ -1215,7 +1250,7 @@ static int agc_scanout_probe_formats(void *agc_defaults, evo_video_buffer_t *buf
                              c->name, (unsigned long long)opt);
                 continue;
             }
-            agc_scanout_set_10bit(1);
+            agc_scanout_set_cb_format(1);
             evo_agc_runtime_cache_flush(g_agc_dev.gpu_regs, sizeof(evo_agc_gpu_regs_t));
 
             memset(attr, 0, sizeof *attr);
@@ -1241,6 +1276,7 @@ static int agc_scanout_probe_formats(void *agc_defaults, evo_video_buffer_t *buf
         }
     }
     s_scanout_rgb = keep_rgb;
+    s_scanout_fmt_used = 0;
     return -1;
 }
 
@@ -1271,7 +1307,7 @@ static void agc_scanout_probe_change_attr(void *agc_defaults, evo_video_buffer_t
         s_scanout_rgb = keep_rgb;
         return;
     }
-    agc_scanout_set_10bit(1);
+    agc_scanout_set_cb_format(1);
     evo_agc_runtime_cache_flush(g_agc_dev.gpu_regs, sizeof(evo_agc_gpu_regs_t));
 
     memset(attr, 0, sizeof *attr);
@@ -1505,7 +1541,7 @@ int evo_agc_runtime_init(int width, int height, int hdr)
      * always writes the 8-bit encoding, so an HDR bring-up has to retype it
      * here - set_hdr_output() only does it when switching at runtime. */
     if (hdr)
-        agc_scanout_set_10bit(1);
+        agc_scanout_set_cb_format(1);
 
     /* 5. Compile All AGC Pipelines */
     /* Only the UI pipeline is required. The video pipelines are converted to
@@ -1795,7 +1831,7 @@ int evo_agc_runtime_init(int width, int height, int hdr)
         setup_color_target(g_agc_dev.gpu_regs->color_targets[1], agc_defaults,
                            g_agc_dev.scanout_buffers[1], (uint32_t)g_agc_dev.width,
                            (uint32_t)g_agc_dev.height, scanout_comp_swap_alt());
-        agc_scanout_set_10bit(g_agc_dev.is_hdr);
+        agc_scanout_set_cb_format(g_agc_dev.is_hdr);
         evo_agc_runtime_cache_flush(g_agc_dev.gpu_regs, sizeof(evo_agc_gpu_regs_t));
     } else {
         sceVideoOutSetBufferAttribute2(&attr, vfmt, 0,
@@ -1804,6 +1840,8 @@ int evo_agc_runtime_init(int width, int height, int hdr)
 
         ret = sceVideoOutRegisterBuffers2(g_agc_dev.video_handle, 0, 0,
                                           video_buffers, 2, &attr, 0, NULL);
+        if (ret == 0)
+            s_scanout_fmt_used = vfmt;
     }
     /* evo_boot_log, not printf: this file's printf output never reaches
      * evo.log or klog, so every one of these diagnostics was invisible. */
@@ -1839,6 +1877,8 @@ int evo_agc_runtime_init(int width, int height, int hdr)
                                            0, 0, 0);
             ret = sceVideoOutRegisterBuffers2(g_agc_dev.video_handle, 0, 0,
                                               video_buffers, 2, &attr, 0, NULL);
+            if (ret == 0)
+                s_scanout_fmt_used = vfmt;
         }
     }
 
@@ -2069,7 +2109,7 @@ void evo_agc_runtime_frame_begin(void)
             const uint32_t sdr_clear = 0xff100d0du;
 #endif
             evo_agc_runtime_stream_fill(backbuffer,
-                                        g_agc_dev.is_hdr ? 0xc0000000u : sdr_clear,
+                                        scanout_clear_value(sdr_clear),
                                         scanout_tiled_bytes());
         }
     }
@@ -2597,6 +2637,25 @@ void evo_agc_runtime_frame_end(void)
                                                    g_agc_dev.active_backbuffer,
                                                    1 /* VSYNC */,
                                                    (int64_t)g_agc_dev.flip_arg);
+            /*
+             * One-shot: what does the console say the output is now that a PQ
+             * buffer is actually on screen? Registration being accepted is not
+             * the same as the display entering HDR, and this is the only
+             * programmatic way to tell the two apart.
+             */
+            if (g_agc_dev.is_hdr && !g_agc_dev.hdr_status_logged) {
+                g_agc_dev.hdr_status_logged = 1;
+                evo_vo_output_status vout;
+                memset(&vout, 0, sizeof vout);
+                int32_t vorc = sceVideoOutGetOutputStatus(g_agc_dev.video_handle, &vout);
+                evo_boot_log("agc hdr: after first flip fmt=%#llx rc=%d dynamic_range=%u "
+                             "(%s) flags=%#llx",
+                             (unsigned long long)s_scanout_fmt_used, vorc,
+                             vout.dynamic_range,
+                             vout.dynamic_range == 2 ? "HDR" : "SDR",
+                             (unsigned long long)vout.flags);
+                evo_boot_log_flush();
+            }
             if(waits < 500000u / step_us) {
                 agc_upscale_observe_fence(slot,marker);
                 g_agc_dev.fence_expect[slot] = 0;
@@ -2731,10 +2790,10 @@ void evo_agc_runtime_set_player_mode(int is_player)
             uint32_t *buf = (uint32_t *)g_agc_dev.scanout_buffers[b];
             if (buf) {
 #ifdef NUVIO_APP
-                evo_agc_runtime_stream_fill(buf, g_agc_dev.is_hdr ? 0xc0000000u : 0xff000000u,
+                evo_agc_runtime_stream_fill(buf, scanout_clear_value(0xff000000u),
                                             scanout_tiled_bytes());
 #else
-                evo_agc_runtime_stream_fill(buf, g_agc_dev.is_hdr ? 0xc0000000u : 0xff100d0du,
+                evo_agc_runtime_stream_fill(buf, scanout_clear_value(0xff100d0du),
                                             scanout_tiled_bytes());
 #endif
             }
@@ -2833,6 +2892,11 @@ void evo_agc_runtime_read_scanout(uint32_t *bgra, int width, int height)
 int evo_agc_probe_rgb(uint8_t *rgb, int n)
 {
     if (!g_agc_dev.initialized || !rgb || n <= 0)
+        return 0;
+    /* The de-swizzle below indexes 32-bit words. A 16-bit float scanout is two
+     * words per pixel, so the mapping does not hold; this probe only feeds the
+     * tuner's sweep diagnostics, so report nothing rather than nonsense. */
+    if (scanout_is_16f())
         return 0;
     const int front = 1 - g_agc_dev.active_backbuffer;
     const uint32_t *src = (const uint32_t *)g_agc_dev.scanout_buffers[front];
@@ -2972,16 +3036,37 @@ int evo_agc_runtime_get_refresh_rate(void)
 
 /* CB_COLOR0_INFO is word 2 of every block setup_color_target() builds (the
  * upscaler patches the same word for its FP16 targets). FORMAT is bits 2..6:
- * COLOR_8_8_8_8 = 10, COLOR_2_10_10_10 = 9. NUMBER_TYPE stays UNORM. COMP_SWAP
- * is left alone here - setup_color_target already set it to match the
- * registered channel order (ALT for the Bgr encodings, STD for the Rgb ones). */
-static void agc_scanout_set_10bit(int ten_bit)
+ * COLOR_8_8_8_8 = 10, COLOR_2_10_10_10 = 9, COLOR_16_16_16_16 = 12, and
+ * NUMBER_TYPE is bits 8..10: UNORM = 0, FLOAT = 7. COMP_SWAP is left alone
+ * here - setup_color_target already set it to match the registered channel
+ * order (ALT for the Bgr encodings, STD for the Rgb ones).
+ *
+ * The 16-bit float case matters on 12.40: VideoOut refuses every 10:10:10:2 PQ
+ * encoding and accepts only Rgba16FloatForBt2100Pq, so HDR there writes
+ * 16_16_16_16 FLOAT. The bit pattern follows what the upscaler already does
+ * for its FP16 targets - ROUND_MODE set, BLEND_CLAMP clear. */
+static void agc_scanout_set_cb_format(int hdr)
 {
     for (int i = 0; i < 2; ++i) {
         SceAgcRegister *ct = g_agc_dev.gpu_regs->color_targets[i];
-        ct[2].value = (ct[2].value & ~0x7cu) | ((ten_bit ? 9u : 10u) << 2);
+        if (hdr && scanout_is_16f()) {
+            ct[2].value = (ct[2].value & ~(0x7cu | 0x700u | 0x8000u)) |
+                          (12u << 2) | (7u << 8) | 0x40000u;
+        } else {
+            ct[2].value = (ct[2].value & ~(0x7cu | 0x700u | 0x8000u)) |
+                          ((hdr ? 9u : 10u) << 2);
+        }
     }
     evo_agc_runtime_cache_flush(g_agc_dev.gpu_regs, sizeof(evo_agc_gpu_regs_t));
+}
+
+/* Black in whatever the scanout holds: 0.0f for the float format, PQ code 0
+ * with opaque alpha for 10:10:10:2, an 8-bit BGRA word otherwise. */
+static uint32_t scanout_clear_value(uint32_t sdr_clear)
+{
+    if (!g_agc_dev.is_hdr)
+        return sdr_clear;
+    return scanout_is_16f() ? 0u : 0xc0000000u;
 }
 
 int32_t sceVideoOutSubmitChangeBufferAttribute2(int32_t handle, int32_t set_index,
@@ -3047,7 +3132,7 @@ int evo_agc_runtime_set_hdr_output(int enable)
         return -1;
     }
 
-    agc_scanout_set_10bit(enable);
+    agc_scanout_set_cb_format(enable);
     g_agc_dev.is_hdr = enable;
     /* Both buffers still hold pixels in the old format: clear them on their
      * next use, and redraw the video into each. */
