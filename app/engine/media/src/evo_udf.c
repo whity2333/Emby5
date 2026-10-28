@@ -425,6 +425,41 @@ static unsigned be16(const unsigned char *p)
     return ((unsigned)p[0] << 8) | (unsigned)p[1];
 }
 
+/* A Blu-ray language code: three lowercase ASCII letters. */
+static int is_lang3(const unsigned char *p)
+{
+    return p[0] >= 'a' && p[0] <= 'z' &&
+           p[1] >= 'a' && p[1] <= 'z' &&
+           p[2] >= 'a' && p[2] <= 'z';
+}
+
+static void collect_track_langs(const unsigned char *b, size_t n, evo_udf_title *out)
+{
+    for (size_t i = 0; i + 3 <= n; i++) {
+        int back;
+
+        if (!is_lang3(b + i))
+            continue;
+
+        for (back = 1; back <= 16 && i >= (size_t)back + 1; back++) {
+            size_t q = i - (size_t)back - 1;
+            unsigned pid = ((unsigned)b[q] << 8) | (unsigned)b[q + 1];
+
+            if (pid < 0x0100 || pid > 0x1FFF)
+                continue;
+            if (out->ntracks >= EVO_UDF_MAX_TRACKS)
+                return;
+
+            out->tracks[out->ntracks].pid = (uint16_t)pid;
+            memcpy(out->tracks[out->ntracks].lang, b + i, 3);
+            out->tracks[out->ntracks].lang[3] = 0;
+            out->ntracks++;
+            i += 2;   /* past this code */
+            break;
+        }
+    }
+}
+
 /*
  * Read one .mpls. Returns its total duration in 45 kHz ticks, or -1 when the
  * playlist does not reference `clip` (a 5-character clip id, "00008").
@@ -513,59 +548,23 @@ static int64_t mpls_read(udfread *udf, const char *path, const char *clip,
             }
 
             /*
-             * STN_table follows the playitem's fixed part:
-             *   length(2) clip(5) codec(4) reserved(1) flags(1) stc(1)
-             *   in(4) out(4) UO_mask_table(8) random_access+still_mode(1)
-             * = 31 bytes. Missing the 9 bytes of UO mask and flags puts the
-             * table 9 bytes early, where the entry counts read as zero and no
-             * language is ever found.
+             * Collect the stream languages.
+             *
+             * Fixed offsets did not survive contact with a real disc: the
+             * playitem's optional fields (UO mask, still mode) shift the
+             * STN_table, and the stream entries are not the 9/8 bytes the
+             * spec sketch suggests. What is reliable is the shape of the data:
+             * a three-letter lowercase language code, with the stream's PID a
+             * few bytes before it.
+             *
+             * So scan for that instead: for every three lowercase letters in
+             * the playitem, take the nearest preceding big-endian pair that
+             * looks like a Blu-ray PID (0x0100-0x1FFF). The video entry has no
+             * language, which is why its slot holds something that is not
+             * letters and is skipped.
              */
-            if (out) {
-                size_t q = p + 31;
-                size_t p_end = p + 2 + plen;
-
-                if (q + 12 <= p_end) {
-                    unsigned n_video = buf[q + 4];
-                    unsigned n_audio = buf[q + 5];
-                    unsigned n_pg    = buf[q + 6];
-                    unsigned n_ig    = buf[q + 7];
-                    unsigned total_e = n_video + n_audio + n_pg + n_ig;
-
-                    q += 16;   /* length(2) reserved(2) 7 counts(7) reserved(5) */
-
-                    for (unsigned k = 0; k < total_e && q + 4 <= p_end; k++) {
-                        unsigned elen = buf[q];
-                        unsigned type = buf[q + 1];
-                        unsigned pid  = be16(buf + q + 2);
-                        size_t   qa   = q + 3;   /* attributes start */
-                        size_t   qn   = q + 1 + elen;
-                        int      lang_at = -1;
-
-                        if (qn > p_end)
-                            break;
-
-                        if (type >= 0x80 && type <= 0x87)
-                            lang_at = 2;   /* audio_format(1) + reserved(1) */
-                        else if (type == 0x90)
-                            lang_at = 1;   /* reserved(1) */
-
-                        if (lang_at >= 0 && qa + lang_at + 3 <= qn &&
-                            out->ntracks < EVO_UDF_MAX_TRACKS) {
-                            evo_udf_track *t = &out->tracks[out->ntracks];
-                            t->pid = (uint16_t)pid;
-                            memcpy(t->lang, buf + qa + lang_at, 3);
-                            t->lang[3] = 0;
-                            /* drop padding */
-                            for (int c = 2; c >= 0 && (t->lang[c] == 0 || t->lang[c] == ' '); c--)
-                                t->lang[c] = 0;
-                            if (t->lang[0])
-                                out->ntracks++;
-                        }
-
-                        q = qn;
-                    }
-                }
-            }
+            if (out)
+                collect_track_langs(buf + p + 22, (size_t)plen - 20, out);
 
             p += 2 + plen;
         }
