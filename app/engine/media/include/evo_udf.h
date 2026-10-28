@@ -87,6 +87,15 @@ void evo_udf_close_window(void *pb, void *handle);
  */
 void evo_udf_window_enable_seek(void *pb);
 
+/*
+ * Size of the window behind `pb`, or 0 when it is not one.
+ *
+ * The demuxer asks so it can tell a disc-image stream from an ordinary one and
+ * seek it by byte position: mpegts has no index and its timestamp seek returns
+ * success here without moving the byte stream.
+ */
+int64_t evo_udf_window_size_of(void *pb);
+
 #ifdef __cplusplus
 }
 #endif

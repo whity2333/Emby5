@@ -9,6 +9,7 @@
  */
 #include "emby5_bitstream.h"
 #include "evo_demux.h"
+#include "evo_udf.h"
 #include "evo_thread.h"
 
 #include <errno.h>
@@ -358,19 +359,43 @@ packet_queue_clear(
     }
     const int64_t seek_t0 = av_gettime_relative();
 
-    int result =
-        av_seek_frame(
-            play_fmt,
-            seek_stream,
-            seek_timestamp,
-            AVSEEK_FLAG_BACKWARD
-        );
+    int result;
 
-    /* Big files (14 GB GTA trailer) whose stream index doesn't cover the byte
-     * range can fail the timestamp seek; fall back to a byte seek. */
-    if (result < 0) {
-        result = av_seek_frame(play_fmt, seek_stream, seek_timestamp,
-                               AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_ANY);
+    /*
+     * A disc-image window cannot be seeked by timestamp here. mpegts has no
+     * index, and av_seek_frame() returns success without moving the byte
+     * stream at all: the window's seek callback is only ever asked for a few
+     * bytes, and the picture stays where it was while the UI shows the target.
+     *
+     * Seek by byte position instead. The window knows its size and the
+     * playlist supplied the duration, which is all a proportional estimate
+     * needs; mpegts then resyncs to the next packet header on its own.
+     */
+    {
+        int64_t win_size = evo_udf_window_size_of(play_fmt->pb);
+
+        if (win_size > 0 && play_fmt->duration > 0 && target_seconds > 0.0) {
+            double frac = target_seconds /
+                          ((double)play_fmt->duration / (double)AV_TIME_BASE);
+            char d[96];
+
+            if (frac < 0.0) frac = 0.0;
+            if (frac > 1.0) frac = 1.0;
+            {
+                int64_t byte = (int64_t)(frac * (double)win_size) & ~(int64_t)2047;
+                snprintf(d, sizeof d, "byte=%lld frac=%.4f", (long long)byte, frac);
+                pp_stage_bc("SEEK_BYTE", d);
+                result = av_seek_frame(play_fmt, -1, byte, AVSEEK_FLAG_BYTE);
+            }
+        } else {
+            result = av_seek_frame(play_fmt, seek_stream, seek_timestamp,
+                                   AVSEEK_FLAG_BACKWARD);
+            /* Big files (14 GB GTA trailer) whose stream index doesn't cover
+             * the byte range can fail the timestamp seek. */
+            if (result < 0)
+                result = av_seek_frame(play_fmt, seek_stream, seek_timestamp,
+                                       AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_ANY);
+        }
     }
     {
         char d[112];

@@ -482,6 +482,7 @@ static int64_t mpls_read(udfread *udf, const char *path, const char *clip,
         size_t p = (size_t)pl_start + 10;
         int64_t sum = 0;
         int references_clip = 0;
+        static int s_dumped = 0;
 
         for (unsigned i = 0; i < n_items && p + 22 <= got; i++) {
             unsigned plen = be16(buf + p);
@@ -490,8 +491,19 @@ static int64_t mpls_read(udfread *udf, const char *path, const char *clip,
 
             /* playitem: length(2) clip_name(5) codec(4) reserved(1)
              *           connection_condition(1) stc_id(1) in(4) out(4) */
-            if (!memcmp(buf + p + 2, clip, 5))
+            if (!memcmp(buf + p + 2, clip, 5)) {
                 references_clip = 1;
+                if (out && !s_dumped) {
+                    char hex[3 * 80 + 1];
+                    size_t hn = 0;
+                    for (int k = 0; k < 80 && p + 22 + k < got; k++)
+                        hn += (size_t)snprintf(hex + hn, sizeof hex - hn, "%02x",
+                                               buf[p + 22 + k]);
+                    hex[hn] = 0;
+                    evo_boot_log("UDF: playitem raw at +22: %s", hex);
+                    s_dumped = 1;
+                }
+            }
 
             {
                 uint32_t in_time  = be32(buf + p + 14);
@@ -614,6 +626,60 @@ static void title_from_playlists(udfread *udf, const char *clip, evo_udf_title *
 }
 
 /* ------------------------------------------------------------------ */
+/* window registry: lets the demuxer recognise a disc-image stream     */
+/* ------------------------------------------------------------------ */
+
+#define WIN_REG_MAX 4
+
+static pthread_mutex_t s_win_lock = PTHREAD_MUTEX_INITIALIZER;
+static AVIOContext    *s_win_pb[WIN_REG_MAX];
+static int64_t         s_win_size[WIN_REG_MAX];
+
+static void win_register(AVIOContext *pb, int64_t size)
+{
+    pthread_mutex_lock(&s_win_lock);
+    for (int i = 0; i < WIN_REG_MAX; i++) {
+        if (!s_win_pb[i]) {
+            s_win_pb[i] = pb;
+            s_win_size[i] = size;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_win_lock);
+}
+
+static void win_unregister(AVIOContext *pb)
+{
+    pthread_mutex_lock(&s_win_lock);
+    for (int i = 0; i < WIN_REG_MAX; i++) {
+        if (s_win_pb[i] == pb) {
+            s_win_pb[i] = NULL;
+            s_win_size[i] = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_win_lock);
+}
+
+int64_t evo_udf_window_size_of(void *pb_v)
+{
+    AVIOContext *pb = (AVIOContext *)pb_v;
+    int64_t size = 0;
+
+    if (!pb)
+        return 0;
+    pthread_mutex_lock(&s_win_lock);
+    for (int i = 0; i < WIN_REG_MAX; i++) {
+        if (s_win_pb[i] == pb) {
+            size = s_win_size[i];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_win_lock);
+    return size;
+}
+
+/* ------------------------------------------------------------------ */
 /* public                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -702,6 +768,8 @@ int evo_udf_open_window(const char *url, int64_t offset, int64_t size,
      * finished, which is when the player needs it and the demuxer no longer
      * probes.
      */
+    win_register(pb, size);
+
     *out_pb     = pb;
     *out_handle = w;
     evo_boot_log("UDF: window ready, %lld bytes at offset %lld",
@@ -732,6 +800,7 @@ void evo_udf_close_window(void *pb_v, void *handle)
     win_io *w = (win_io *)handle;
 
     if (pb) {
+        win_unregister(pb);
         av_freep(&pb->buffer);
         avio_context_free(&pb);
     }
