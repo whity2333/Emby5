@@ -2748,10 +2748,15 @@ int evo_agc_runtime_set_hdr_output(int enable)
          * several is safe; the accepted one is remembered for every later
          * register.
          */
+        /*
+         * Only BGR-ordered candidates. The scanout is written BGR (the GPU
+         * uses COMP_SWAP=ALT), so an RGB-ordered format would be accepted by
+         * the console and then show swapped red and blue - or nothing - and,
+         * worse, it would be remembered and used for every later register.
+         * A wrong-colour HDR is not an improvement over SDR.
+         */
         static const struct { uint64_t fmt; const char *name; } alt[] = {
             { UINT64_C(0x8100000000000007), "A2B10G10R10" },
-            { UINT64_C(0x8100000000000006), "A2R10G10B10" },
-            { UINT64_C(0x8100000022000000), "Bgr10A2 rgb-order" },
             { UINT64_C(0x8100000000000000), "Bgr10A2" },
         };
         for (unsigned k = 0; k < sizeof alt / sizeof alt[0]; k++) {
@@ -2766,6 +2771,32 @@ int evo_agc_runtime_set_hdr_output(int enable)
             evo_boot_log("agc hdr: alt %-18s fmt=%#llx rc=%d (0x%08x)",
                          alt[k].name, (unsigned long long)alt[k].fmt, r2, (unsigned)r2);
             if (r2 == 0) {
+                /*
+                 * Accepted is not the same as working: confirm the output
+                 * actually reports HDR before keeping this format. If it does
+                 * not, put the SDR attribute back and treat HDR as refused -
+                 * a format the console takes but the display does not honour
+                 * would leave the screen wrong for the whole session.
+                 */
+                evo_vo_output_status chk;
+                memset(&chk, 0, sizeof chk);
+                if (sceVideoOutGetOutputStatus(g_agc_dev.video_handle, &chk) == 0 &&
+                    chk.dynamic_range != 2) {
+                    evo_boot_log("agc hdr: alt %s accepted but output is still "
+                                 "dynamic_range=%u - reverting to SDR",
+                                 alt[k].name, chk.dynamic_range);
+                    {
+                        evo_video_attribute_t sdr;
+                        memset(&sdr, 0, sizeof sdr);
+                        sceVideoOutSetBufferAttribute2(&sdr, EVO_AGC_VIDEO_FORMAT_SDR, 0,
+                                                       (uint32_t)g_agc_dev.width,
+                                                       (uint32_t)g_agc_dev.height, 0, 0, 0);
+                        sceVideoOutSubmitChangeBufferAttribute2(g_agc_dev.video_handle,
+                                                                0, &sdr, NULL);
+                    }
+                    rc = -1;
+                    break;
+                }
                 g_agc_dev.hdr_fmt = alt[k].fmt;
                 rc = 0;
                 break;
