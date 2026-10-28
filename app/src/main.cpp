@@ -300,6 +300,46 @@ void install_crash_handler()
 
 int init_display()
 {
+    /*
+     * The scanout used to be opened as SDR unconditionally, and that is exactly
+     * what puts the console in SDR: registering SDR buffers is a request for
+     * SDR output, so the home screen's HDR is dropped the moment Emby5 starts.
+     * A later switch back is refused, which is why HDR never turned on no
+     * matter what the disc carried.
+     *
+     * display.conf with hdr_init=1 opens in HDR10 from the first frame
+     * instead. If the console refuses it the request file is removed and SDR
+     * is used, so a bad request can never leave the app unable to start.
+     */
+    static int s_hdr_init = -1;
+    if (s_hdr_init < 0) {
+        s_hdr_init = 0;
+        std::FILE *fp = std::fopen("/data/Emby5/display.conf", "r");
+        if (fp) {
+            char line[128];
+            while (std::fgets(line, sizeof line, fp)) {
+                int v = 0;
+                if (std::sscanf(line, "hdr_init=%d", &v) == 1 && v > 0)
+                    s_hdr_init = 1;
+            }
+            std::fclose(fp);
+        }
+        if (s_hdr_init)
+            evo_boot_log("emby5: display.conf asks for an HDR10 bring-up");
+    }
+
+    if (s_hdr_init &&
+        evo_agc_runtime_init(evo::DisplayWidth, evo::DisplayHeight, 1) == 0) {
+        evo_boot_log("emby5: display initialised in HDR10");
+        evo_agc_runtime_get_size(&evo::DisplayWidth, &evo::DisplayHeight);
+        return 0;
+    }
+    if (s_hdr_init) {
+        evo_boot_log("emby5: HDR10 bring-up refused - removing display.conf, using SDR");
+        std::remove("/data/Emby5/display.conf");
+        s_hdr_init = 0;
+    }
+
     /* Only the native graphics runtime is needed before the first branded frame. */
     if (evo_agc_runtime_init(evo::DisplayWidth, evo::DisplayHeight, 0) != 0)
         return -1;
