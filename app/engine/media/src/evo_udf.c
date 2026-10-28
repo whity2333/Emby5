@@ -387,6 +387,15 @@ static int64_t win_seek(void *opaque, int64_t off, int whence)
     }
     pthread_mutex_unlock(&w->lock);
 
+    /*
+     * The player's seek reported success while the picture never moved, so
+     * either this is not being called or the reposition underneath fails.
+     * Both are visible here.
+     */
+    evo_boot_log("UDF: win_seek(whence=%d target=%lld) -> %lld (underlying seekable=%d)",
+                 whence, (long long)target, (long long)r,
+                 w->under ? w->under->seekable : -1);
+
     return r;
 }
 
@@ -491,9 +500,16 @@ static int64_t mpls_read(udfread *udf, const char *path, const char *clip,
                     sum += (int64_t)(out_time - in_time);
             }
 
-            /* STN_table follows the fixed part of the playitem. */
+            /*
+             * STN_table follows the playitem's fixed part:
+             *   length(2) clip(5) codec(4) reserved(1) flags(1) stc(1)
+             *   in(4) out(4) UO_mask_table(8) random_access+still_mode(1)
+             * = 31 bytes. Missing the 9 bytes of UO mask and flags puts the
+             * table 9 bytes early, where the entry counts read as zero and no
+             * language is ever found.
+             */
             if (out) {
-                size_t q = p + 22;
+                size_t q = p + 31;
                 size_t p_end = p + 2 + plen;
 
                 if (q + 12 <= p_end) {
@@ -503,7 +519,7 @@ static int64_t mpls_read(udfread *udf, const char *path, const char *clip,
                     unsigned n_ig    = buf[q + 7];
                     unsigned total_e = n_video + n_audio + n_pg + n_ig;
 
-                    q += 12;   /* length, reserved, 7 counts, 5 reserved */
+                    q += 16;   /* length(2) reserved(2) 7 counts(7) reserved(5) */
 
                     for (unsigned k = 0; k < total_e && q + 4 <= p_end; k++) {
                         unsigned elen = buf[q];
