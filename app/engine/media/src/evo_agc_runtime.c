@@ -263,6 +263,11 @@ int32_t sceVideoOutRegisterBuffers2(int32_t handle, int32_t set_index, int32_t s
                                     int32_t option, void *reserved);
 int32_t sceVideoOutUnregisterBuffers(int32_t handle, int32_t set_index);
 int32_t sceVideoOutWaitVblank(int32_t handle);
+/* Retypes an already-registered set in place - the call games use to toggle
+ * HDR. Declared here as well because the format probe uses it before the
+ * definition of the runtime switch that also calls it. */
+int32_t sceVideoOutSubmitChangeBufferAttribute2(int32_t handle, int32_t set_index,
+                                                const void *attribute, const void *option);
 /* CPU-side flip - what pp_videoout.c used (hardware-verified) rather than
  * relying solely on the GPU's sceAgcDcbSetFlip packet. */
 int32_t sceVideoOutSubmitFlip(int32_t handle, int32_t buffer_index,
@@ -1174,6 +1179,10 @@ static const agc_fmt_cand k_scanout_candidates[] = {
     { UINT64_C(0x8100000000000000), 0, "Bgr10A2Srgb",    0 },
     { UINT64_C(0x8100000622000000), 1, "Rgb10A2",        0 },
     { UINT64_C(0x8100000600000000), 0, "Bgr10A2",        0 },
+    /* Diagnostic only: same PQ marker as the two at the top, so it is expected
+     * to be refused the same way. If it registers, the working space is
+     * reachable and the 10:10:10:2 encodings are what this firmware dislikes. */
+    { UINT64_C(0xC001070722000000), 1, "Rgba16FloatBt2100Pq", 0 },
 };
 
 /* StrictColorimetry is VideoOutBufferAttributeOption bit 3. */
@@ -1233,6 +1242,58 @@ static int agc_scanout_probe_formats(void *agc_defaults, evo_video_buffer_t *buf
     }
     s_scanout_rgb = keep_rgb;
     return -1;
+}
+
+/*
+ * The other half of the question: RegisterBuffers2 refuses PQ outright, but
+ * SubmitChangeBufferAttribute2 - the call games actually use to toggle HDR -
+ * is a different code path in the service. It was only ever tried from the
+ * 8-bit SDR set. Here a 10-bit set that this console does accept is
+ * registered first and then retyped to each PQ encoding, so the 10-bit-ness
+ * and the PQ-ness are separated.
+ */
+static void agc_scanout_probe_change_attr(void *agc_defaults, evo_video_buffer_t *bufs,
+                                          evo_video_attribute_t *attr, uint32_t w, uint32_t h)
+{
+    static const uint64_t pq[] = {
+        UINT64_C(0x8100070422000000),   /* Rgb10A2Bt2100Pq */
+        UINT64_C(0x8100070400000000),   /* Bgr10A2Bt2100Pq */
+    };
+    const int keep_rgb = s_scanout_rgb;
+
+    s_scanout_rgb = 1;
+    if (setup_color_target(g_agc_dev.gpu_regs->color_targets[0], agc_defaults,
+                           g_agc_dev.scanout_buffers[0], w, h,
+                           scanout_comp_swap_alt()) != 0 ||
+        setup_color_target(g_agc_dev.gpu_regs->color_targets[1], agc_defaults,
+                           g_agc_dev.scanout_buffers[1], w, h,
+                           scanout_comp_swap_alt()) != 0) {
+        s_scanout_rgb = keep_rgb;
+        return;
+    }
+    agc_scanout_set_10bit(1);
+    evo_agc_runtime_cache_flush(g_agc_dev.gpu_regs, sizeof(evo_agc_gpu_regs_t));
+
+    memset(attr, 0, sizeof *attr);
+    sceVideoOutSetBufferAttribute2(attr, UINT64_C(0x8100000022000000), 0, w, h, 0, 0, 0);
+    int32_t rc = sceVideoOutRegisterBuffers2(g_agc_dev.video_handle, 0, 0,
+                                             bufs, 2, attr, 0, NULL);
+    evo_boot_log("agc hdr probe: change-attr base Rgb10A2Srgb -> rc=%d (0x%08x)",
+                 rc, (unsigned)rc);
+    if (rc == 0) {
+        for (unsigned i = 0; i < sizeof pq / sizeof pq[0]; ++i) {
+            evo_video_attribute_t a2;
+            memset(&a2, 0, sizeof a2);
+            sceVideoOutSetBufferAttribute2(&a2, pq[i], 0, w, h, 0, 0, 0);
+            int32_t c = sceVideoOutSubmitChangeBufferAttribute2(g_agc_dev.video_handle, 0,
+                                                                &a2, NULL);
+            evo_boot_log("agc hdr probe: change-attr 10bit -> %#llx rc=%d (0x%08x)",
+                         (unsigned long long)pq[i], c, (unsigned)c);
+        }
+        sceVideoOutUnregisterBuffers(g_agc_dev.video_handle, 0);
+    }
+    evo_boot_log_flush();
+    s_scanout_rgb = keep_rgb;
 }
 
 int evo_agc_runtime_init(int width, int height, int hdr)
@@ -1663,6 +1724,20 @@ int evo_agc_runtime_init(int width, int height, int hdr)
                          vout.dynamic_range == 2 ? "HDR" : (vout.dynamic_range == 1 ? "SDR" : "Unknown"),
                          (unsigned long long)vout.refresh_rate,
                          (unsigned long long)vout.flags);
+            /*
+             * Raw dump: the field layout above is SharpProspero's, and it is
+             * not certain - refresh_rate reads as a small mode id (3) rather
+             * than a rate, which would mean the struct is packed differently
+             * and dynamic_range may not be the field we think. Twelve dwords
+             * settle it without another guess.
+             */
+            {
+                const uint32_t *raw = (const uint32_t *)&vout;
+                evo_boot_log("agc vo status raw: %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x",
+                             raw[0], raw[1], raw[2], raw[3],
+                             raw[4], raw[5], raw[6], raw[7],
+                             raw[8], raw[9], raw[10], raw[11]);
+            }
         } else {
             evo_boot_log("agc display output probe failed rc=%d", vorc);
         }
@@ -1706,6 +1781,9 @@ int evo_agc_runtime_init(int width, int height, int hdr)
             evo_boot_log("agc hdr probe: 1920x1080 ladder -> %s",
                          small == 0 ? "PQ accepted (mode problem, not format)"
                                     : "also refused (format problem)");
+            agc_scanout_probe_change_attr(agc_defaults, video_buffers, &attr,
+                                          (uint32_t)g_agc_dev.width,
+                                          (uint32_t)g_agc_dev.height);
             evo_boot_log("agc hdr probe: no 10-bit format accepted - refusing HDR");
             ret = -1;
         }
