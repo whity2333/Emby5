@@ -41,11 +41,25 @@ jobs:
           llvm-config --version
           python3 --version
 
+      - name: Cache PS5 toolchain
+        id: tc-cache
+        uses: actions/cache@v4
+        with:
+          path: toolchain
+          key: ps5-sdk-v0.43-pacbrew-v0.39-zlib1.3.2
+
       - name: Set up PS5 payload SDK + pacbrew sysroot
         run: |
           chmod +x scripts/setup-toolchain.sh app/scripts/build.sh
-          # 无参数运行才会真正下载并合并 sysroot；--env 只打印变量
-          scripts/setup-toolchain.sh
+          # 无参数运行才会真正下载并合并 sysroot；--env 只打印变量。
+          # zlib.net 偶尔限流会返回错误页导致 checksum mismatch，所以重试。
+          ok=0
+          for attempt in 1 2 3; do
+            if scripts/setup-toolchain.sh; then ok=1; break; fi
+            echo "::warning::toolchain setup attempt ${attempt} failed, retrying"
+            sleep 15
+          done
+          [ "$ok" = 1 ] || { echo "::error::toolchain setup failed after 3 attempts"; exit 1; }
           scripts/setup-toolchain.sh --env > "$RUNNER_TEMP/ps5-env.sh"
           echo "--- generated env ---"
           cat "$RUNNER_TEMP/ps5-env.sh"
