@@ -1296,7 +1296,19 @@ bool PlaybackController::startPlaybackSource(const PlaybackSource& source,
         int64_t seekTs = static_cast<int64_t>(
             seekPos / av_q2d(play_fmt->streams[seekStream]->time_base));
 
-        if (av_seek_frame(play_fmt, seekStream, seekTs, AVSEEK_FLAG_BACKWARD) >= 0) {
+        /*
+         * Resume is a seek like any other, and a disc-image stream needs the
+         * byte-position path here too: a timestamp seek reports success and
+         * leaves the picture at the top, while the base arithmetic below then
+         * makes the reported position match the resume point - the UI says
+         * 27:51 and the film plays from the start.
+         */
+        const int resume_rc =
+            (evo_stream_io_seek_iso(play_fmt, seekPos) == 0)
+                ? 0
+                : av_seek_frame(play_fmt, seekStream, seekTs, AVSEEK_FLAG_BACKWARD);
+
+        if (resume_rc >= 0) {
             evo_vdec_flush(g_vdec);
             if (g_adec)
                 evo_adec_flush(g_adec);

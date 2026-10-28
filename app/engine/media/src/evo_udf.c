@@ -433,23 +433,47 @@ static int is_lang3(const unsigned char *p)
            p[2] >= 'a' && p[2] <= 'z';
 }
 
+static int is_lower_alpha(unsigned char c)
+{
+    return c >= 'a' && c <= 'z';
+}
+
+/*
+ * The language code sits at the END of a run of lowercase letters: the byte
+ * before it is an audio attribute that can itself be a letter (0x61 is 'a' on
+ * this disc), so a naive three-letter match returns "ajp" and skips "jpn".
+ * Take the last three characters of each maximal run instead.
+ */
 static void collect_track_langs(const unsigned char *b, size_t n, evo_udf_title *out)
 {
-    for (size_t i = 0; i + 3 <= n; i++) {
+    size_t i = 0;
+
+    while (i < n) {
+        size_t run_start, run_len, code_at;
         int back;
 
-        if (!is_lang3(b + i))
+        if (!is_lower_alpha(b[i])) {
+            i++;
+            continue;
+        }
+        run_start = i;
+        while (i < n && is_lower_alpha(b[i]))
+            i++;
+        run_len = i - run_start;
+        if (run_len < 3)
             continue;
 
-        for (back = 1; back <= 16 && i >= (size_t)back + 1; back++) {
-            size_t q = i - (size_t)back - 1;
+        code_at = i - 3;   /* last three of the run */
+
+        for (back = 1; back <= 16 && code_at >= (size_t)back + 1; back++) {
+            size_t q = code_at - (size_t)back - 1;
             unsigned pid = ((unsigned)b[q] << 8) | (unsigned)b[q + 1];
 
             /*
-             * Blu-ray elementary streams sit at 0x1000-0x1FFF. The wider
-             * 0x0100-0x1FFF range also matched the pair just before the code -
-             * "05 83" is a stream-entry length and codec, and 0x0583 reads as
-             * a plausible PID, which is why every track came back with 1424.
+             * Blu-ray elementary streams sit at 0x1000-0x1FFF. A wider range
+             * also matches the stream entry's length and codec pair ("05 83"
+             * reads as PID 0x0583), which is why every track came back as
+             * 1424.
              */
             if (pid < 0x1000 || pid > 0x1FFF)
                 continue;
@@ -457,10 +481,9 @@ static void collect_track_langs(const unsigned char *b, size_t n, evo_udf_title 
                 return;
 
             out->tracks[out->ntracks].pid = (uint16_t)pid;
-            memcpy(out->tracks[out->ntracks].lang, b + i, 3);
+            memcpy(out->tracks[out->ntracks].lang, b + code_at, 3);
             out->tracks[out->ntracks].lang[3] = 0;
             out->ntracks++;
-            i += 2;   /* past this code */
             break;
         }
     }
@@ -702,7 +725,7 @@ int evo_udf_main_title(const char *url, evo_udf_title *out)
 
     /* Build marker: the fastest way to tell from a log which binary is
      * running when several local builds are floating around. */
-    evo_boot_log("ISO: looking for a BDMV title (iso-play/2)");
+    evo_boot_log("ISO: looking for a BDMV title (iso-play/3)");
 
     if (udf_walk(url, 1, out) <= 0 || out->size <= 0)
         return -1;

@@ -96,6 +96,31 @@ int evo_stream_io_is_aborted(evo_stream_io_ctx_t *ctx)
     return 0;
 }
 
+int evo_stream_io_seek_iso(AVFormatContext *fmt, double seconds)
+{
+    int64_t win_size;
+    double frac;
+    int64_t byte;
+
+    if (!fmt || !fmt->pb)
+        return -1;
+    win_size = evo_udf_window_size_of(fmt->pb);
+    if (win_size <= 0 || fmt->duration <= 0 || seconds <= 0.0)
+        return -1;
+
+    frac = seconds / ((double)fmt->duration / (double)AV_TIME_BASE);
+    if (frac < 0.0) frac = 0.0;
+    if (frac > 1.0) frac = 1.0;
+    byte = (int64_t)(frac * (double)win_size) & ~(int64_t)2047;
+
+    {
+        char d[96];
+        snprintf(d, sizeof d, "byte=%lld frac=%.4f", (long long)byte, frac);
+        SIO_BC("SEEK_BYTE", d);
+    }
+    return av_seek_frame(fmt, -1, byte, AVSEEK_FLAG_BYTE) >= 0 ? 0 : -1;
+}
+
 int evo_stream_io_probe(evo_stream_io_ctx_t *ctx, AVFormatContext *fmt, double seconds)
 {
     if (!fmt || evo_stream_io_is_aborted(ctx)) return AVERROR_EXIT;

@@ -63,6 +63,16 @@ int evo_stream_io_is_aborted(evo_stream_io_ctx_t *ctx);
  * remains AVERROR_EXIT even if FFmpeg returns partial stream headers as success. */
 int evo_stream_io_probe(evo_stream_io_ctx_t *ctx, AVFormatContext *fmt, double seconds);
 
+/*
+ * Seek a disc-image stream to `seconds` by byte position.
+ *
+ * mpegts has no index and its timestamp seek returns success without moving
+ * the byte stream, so every caller that seeks has to go through this. Returns
+ * 0 when it performed the seek, -1 when `fmt` is not a disc-image window and
+ * the caller should do its own thing.
+ */
+int evo_stream_io_seek_iso(AVFormatContext *fmt, double seconds);
+
 /**
  * Non-zero once an armed deadline has passed - i.e. the last libavformat call
  * returned because it was interrupted rather than because it finished.
