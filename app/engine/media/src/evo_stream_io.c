@@ -5,6 +5,7 @@
  * prefetching (posix_fadvise) and optimized dictionary options for 100+ Mbps 4K media.
  */
 #include "evo_stream_io.h"
+#include "evo_iso_probe.h"
 #include "evo_direct_mem.h"
 #include <libavutil/error.h>
 
@@ -462,6 +463,23 @@ int evo_stream_io_open(const char *path,
 
     if (rc < 0) {
         evo_direct_mem_free(ctx);
+        /*
+         * A disc image (.iso) is a filesystem, not a stream: avformat cannot
+         * open it and the caller only ever sees "unsupported". Probe it here,
+         * on the failure path only, so the log says what the image actually
+         * contains (ISO9660? UDF? partition? descriptor sequence?) instead of
+         * leaving a bare error code. Read-only; a stream that opens normally
+         * never reaches this.
+         *
+         * Probed once per distinct path so a retry loop cannot spam it.
+         */
+        {
+            static char s_last_probed[512];
+            if (path && strcmp(s_last_probed, path) != 0) {
+                snprintf(s_last_probed, sizeof s_last_probed, "%s", path);
+                evo_iso_probe(path);
+            }
+        }
         return rc;
     }
 
