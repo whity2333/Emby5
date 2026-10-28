@@ -143,6 +143,7 @@ extern int      sceKernelConfiguredFlexibleMemorySize(size_t *);
  */
 #define FRAME_POOL_SLOTS            8
 
+
 #ifndef EVO_VDEC_REORDER_DEPTH
 #define EVO_VDEC_REORDER_DEPTH      4
 #endif
@@ -533,6 +534,7 @@ static struct {
     int depth;        /* 0 = default */
     int dpb;          /* 0 = auto */
     int tiles_hw;     /* 1 = let tiled HEVC try the hardware decoder */
+    int frame_slots;  /* 0 = FRAME_POOL_SLOTS; shrinks the frame pool */
 } g_tune;
 
 static void tune_load(void)
@@ -550,10 +552,29 @@ static void tune_load(void)
         else if (sscanf(line, "depth=%d", &v) == 1) g_tune.depth = v;
         else if (sscanf(line, "dpb=%d", &v) == 1) g_tune.dpb = v;
         else if (sscanf(line, "tiles_hw=%d", &v) == 1) g_tune.tiles_hw = v;
+        else if (sscanf(line, "frame_slots=%d", &v) == 1) g_tune.frame_slots = v;
     }
-    note("EVO vdec native: vdec.conf level4k=%d optprog=%d depth=%d dpb=%d tiles_hw=%d",
-         g_tune.level4k, g_tune.optprog, g_tune.depth, g_tune.dpb, g_tune.tiles_hw);
+    note("EVO vdec native: vdec.conf level4k=%d optprog=%d depth=%d dpb=%d tiles_hw=%d frame_slots=%d",
+         g_tune.level4k, g_tune.optprog, g_tune.depth, g_tune.dpb, g_tune.tiles_hw,
+         g_tune.frame_slots);
 }
+
+/*
+ * Frame-pool slots in use. The pool is frame_size * slots of direct memory, and
+ * at 4K a slot is ~24 MB, so the fixed 8 costs ~196 MB - which no longer fits
+ * once the decoder's own gpu region has been allocated. vdec.conf frame_slots=
+ * trades decode look-ahead for fitting at all.
+ */
+static unsigned frame_slot_count(void)
+{
+    int n = g_tune.frame_slots;
+    if (n < 2)
+        return FRAME_POOL_SLOTS;
+    if (n > FRAME_POOL_SLOTS)
+        return FRAME_POOL_SLOTS;
+    return (unsigned)n;
+}
+
 
 /* Set around an on-demand 4K bring-up of a shallow-pipeline (10-bit) slot;
  * 0 = use the descriptor's own depth. See the resize path. */
@@ -638,7 +659,7 @@ static int slot_bringup(struct dec_slot *s, const nat_codec_desc *d,
     s->cpu_gpu_size = align16k((size_t)mem.cpu_gpu_size);
     s->frame_size   = align16k((size_t)mem.max_frame_size);
     s->input_pool   = (size_t)INPUT_SLOT_BYTES * PIPELINE_BUFFER_COUNT;
-    s->frame_pool   = s->frame_size * FRAME_POOL_SLOTS;
+    s->frame_pool   = s->frame_size * frame_slot_count();
     if (s->frame_size == 0) return -1;
     mem.gpu_size = s->gpu_size;
     if (s->cpu_gpu_size) mem.cpu_gpu_size = s->cpu_gpu_size;
@@ -1367,7 +1388,7 @@ static int decode_one(evo_vdec_native *n, const uint8_t *au, int size,
 #endif
 
     unsigned islot = n->au_ring % PIPELINE_BUFFER_COUNT;
-    unsigned fslot = n->au_ring % FRAME_POOL_SLOTS;
+    unsigned fslot = n->au_ring % frame_slot_count();
     n->au_ring++;
 
     uint8_t *slot_mem = n->input_mem + (size_t)islot * INPUT_SLOT_BYTES;
@@ -1500,7 +1521,7 @@ static int decode_one(evo_vdec_native *n, const uint8_t *au, int size,
 static void drain_decoder(evo_vdec_native *n)
 {
     for (int guard = 0; guard < 64; guard++) {
-        unsigned slot = n->au_ring % FRAME_POOL_SLOTS;
+        unsigned slot = n->au_ring % frame_slot_count();
         n->au_ring++;
 
         SceVideodec2FrameBuffer fb;
