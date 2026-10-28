@@ -1143,6 +1143,98 @@ static int evo_agc_apply_render_size(void *agc_defaults, int w, int h)
     return 0;
 }
 
+/* -------------------------------------------------------------------------
+ * HDR scanout format ladder
+ *
+ * sceVideoOutRegisterBuffers2 answers INVALID_PIXEL_FORMAT (0x80290003) to
+ * BOTH BT.2100 PQ encodings on 12.40 - the BGR one and the RGB one - while
+ * Bgra8Srgb registers fine, and SubmitChangeBufferAttribute2 refuses the same
+ * pair at runtime. So the refusal is about the format token itself, not about
+ * the channel order, the size, or when it is asked for.
+ *
+ * Rather than guess again, walk the whole 10-bit family once at bring-up and
+ * log what the console says to each, including the StrictColorimetry option
+ * (bit 3), which a PQ registration may well require. Nothing is registered
+ * while an attempt fails, so retrying in place is safe; a candidate that does
+ * register is unregistered again immediately unless it is PQ, because only a
+ * PQ buffer puts the display into HDR.
+ * ------------------------------------------------------------------------- */
+
+typedef struct {
+    uint64_t    fmt;
+    int         rgb;   /* channel order, and therefore COMP_SWAP */
+    const char *name;
+    int         pq;    /* accepted => real HDR, not just 10-bit */
+} agc_fmt_cand;
+
+static const agc_fmt_cand k_scanout_candidates[] = {
+    { UINT64_C(0x8100070422000000), 1, "Rgb10A2Bt2100Pq", 1 },
+    { UINT64_C(0x8100070400000000), 0, "Bgr10A2Bt2100Pq", 1 },
+    { UINT64_C(0x8100000022000000), 1, "Rgb10A2Srgb",    0 },
+    { UINT64_C(0x8100000000000000), 0, "Bgr10A2Srgb",    0 },
+    { UINT64_C(0x8100000622000000), 1, "Rgb10A2",        0 },
+    { UINT64_C(0x8100000600000000), 0, "Bgr10A2",        0 },
+};
+
+/* StrictColorimetry is VideoOutBufferAttributeOption bit 3. */
+static const uint64_t k_scanout_options[] = { 0, 8 };
+
+static int agc_scanout_probe_formats(void *agc_defaults, evo_video_buffer_t *bufs,
+                                     evo_video_attribute_t *attr, uint32_t w, uint32_t h,
+                                     int keep_on_success, uint64_t *out_fmt)
+{
+    const int keep_rgb = s_scanout_rgb;
+
+    evo_boot_log("agc hdr probe: starting at %ux%u (refresh=%d, 120hz=%d)",
+                 w, h, g_agc_dev.current_refresh_rate,
+                 evo_agc_runtime_is_120hz());
+
+    for (unsigned i = 0; i < sizeof k_scanout_candidates / sizeof k_scanout_candidates[0]; ++i) {
+        const agc_fmt_cand *c = &k_scanout_candidates[i];
+        for (unsigned o = 0; o < sizeof k_scanout_options / sizeof k_scanout_options[0]; ++o) {
+            const uint64_t opt = k_scanout_options[o];
+            /* Re-pair the colour targets for this candidate: RGB stores
+             * R,G,B,A (COMP_SWAP=STD), BGR stores B,G,R,A (ALT). */
+            s_scanout_rgb = c->rgb;
+            if (setup_color_target(g_agc_dev.gpu_regs->color_targets[0], agc_defaults,
+                                   g_agc_dev.scanout_buffers[0], w, h,
+                                   scanout_comp_swap_alt()) != 0 ||
+                setup_color_target(g_agc_dev.gpu_regs->color_targets[1], agc_defaults,
+                                   g_agc_dev.scanout_buffers[1], w, h,
+                                   scanout_comp_swap_alt()) != 0) {
+                evo_boot_log("agc hdr probe: %s option=%llu setup_color_target failed",
+                             c->name, (unsigned long long)opt);
+                continue;
+            }
+            agc_scanout_set_10bit(1);
+            evo_agc_runtime_cache_flush(g_agc_dev.gpu_regs, sizeof(evo_agc_gpu_regs_t));
+
+            memset(attr, 0, sizeof *attr);
+            sceVideoOutSetBufferAttribute2(attr, c->fmt, 0, w, h, opt, 0, 0);
+            int32_t rc = sceVideoOutRegisterBuffers2(g_agc_dev.video_handle, 0, 0,
+                                                     bufs, 2, attr, 0, NULL);
+            evo_boot_log("agc hdr probe: %s fmt=%#llx option=%llu -> rc=%d (0x%08x)",
+                         c->name, (unsigned long long)c->fmt,
+                         (unsigned long long)opt, rc, (unsigned)rc);
+            evo_boot_log_flush();
+            if (rc == 0) {
+                if (c->pq && keep_on_success) {
+                    *out_fmt = c->fmt;
+                    return 0;
+                }
+                /* Diagnostic only: it registered but is either not PQ or not
+                 * the size we intend to keep. Release it so a later attempt
+                 * can take the slot. */
+                sceVideoOutUnregisterBuffers(g_agc_dev.video_handle, 0);
+                evo_boot_log("agc hdr probe: %s %ux%u registered but not kept - released",
+                             c->name, w, h);
+            }
+        }
+    }
+    s_scanout_rgb = keep_rgb;
+    return -1;
+}
+
 int evo_agc_runtime_init(int width, int height, int hdr)
 {
     if (g_agc_dev.initialized)
@@ -1585,12 +1677,56 @@ int evo_agc_runtime_init(int width, int height, int hdr)
     memset(&attr, 0, sizeof(attr));
 
     uint64_t vfmt = scanout_format(g_agc_dev.is_hdr);
-    sceVideoOutSetBufferAttribute2(&attr, vfmt, 0,
-                                   (uint32_t)g_agc_dev.width, (uint32_t)g_agc_dev.height,
-                                   0, 0, 0);
+    /*
+     * An HDR bring-up walks the format ladder first: the encodings that would
+     * normally be asked for are refused on this firmware, and the ladder both
+     * finds one that works and records what the console said to the rest. When
+     * it finds nothing the colour targets are left re-paired for the last
+     * candidate, so restore them before the SDR-style attempt below.
+     */
+    if (g_agc_dev.is_hdr) {
+        uint64_t accepted = 0;
+        if (agc_scanout_probe_formats(agc_defaults, video_buffers, &attr,
+                                      (uint32_t)g_agc_dev.width,
+                                      (uint32_t)g_agc_dev.height, 1, &accepted) == 0) {
+            vfmt = accepted;
+            evo_boot_log("agc hdr probe: accepted %#llx", (unsigned long long)accepted);
+            ret = 0;
+        } else {
+            /*
+             * Is the refusal about the encoding or about the output mode? Ask
+             * the same ladder for 1080p. A PQ format that registers there but
+             * not at the panel size means the mode cannot carry HDR at that
+             * size - 4K120 on an HDMI 2.0-class link is the usual cause - and
+             * not that the token is wrong. Diagnostic only, never kept.
+             */
+            uint64_t at1080 = 0;
+            const int small = agc_scanout_probe_formats(agc_defaults, video_buffers, &attr,
+                                                        1920, 1080, 0, &at1080);
+            evo_boot_log("agc hdr probe: 1920x1080 ladder -> %s",
+                         small == 0 ? "PQ accepted (mode problem, not format)"
+                                    : "also refused (format problem)");
+            evo_boot_log("agc hdr probe: no 10-bit format accepted - refusing HDR");
+            ret = -1;
+        }
+        /* The ladder left the colour targets paired for whichever candidate it
+         * tried last; put them back the way this size wants them. */
+        setup_color_target(g_agc_dev.gpu_regs->color_targets[0], agc_defaults,
+                           g_agc_dev.scanout_buffers[0], (uint32_t)g_agc_dev.width,
+                           (uint32_t)g_agc_dev.height, scanout_comp_swap_alt());
+        setup_color_target(g_agc_dev.gpu_regs->color_targets[1], agc_defaults,
+                           g_agc_dev.scanout_buffers[1], (uint32_t)g_agc_dev.width,
+                           (uint32_t)g_agc_dev.height, scanout_comp_swap_alt());
+        agc_scanout_set_10bit(g_agc_dev.is_hdr);
+        evo_agc_runtime_cache_flush(g_agc_dev.gpu_regs, sizeof(evo_agc_gpu_regs_t));
+    } else {
+        sceVideoOutSetBufferAttribute2(&attr, vfmt, 0,
+                                       (uint32_t)g_agc_dev.width, (uint32_t)g_agc_dev.height,
+                                       0, 0, 0);
 
-    ret = sceVideoOutRegisterBuffers2(g_agc_dev.video_handle, 0, 0,
-                                      video_buffers, 2, &attr, 0, NULL);
+        ret = sceVideoOutRegisterBuffers2(g_agc_dev.video_handle, 0, 0,
+                                          video_buffers, 2, &attr, 0, NULL);
+    }
     /* evo_boot_log, not printf: this file's printf output never reaches
      * evo.log or klog, so every one of these diagnostics was invisible. */
     /* Both scanout bases must be 2MB aligned or the tiled display surface is
