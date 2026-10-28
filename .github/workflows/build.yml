@@ -1,0 +1,78 @@
+# Emby5 — 云端构建（PS5 文件夹格式）
+#
+# 工具链由仓库自带的 scripts/setup-toolchain.sh 下载：
+#   - ps5-payload-sdk v0.43            (~8.8 MB)
+#   - pacbrew sysroot v0.39            (~341 MB，含 FFmpeg/dav1d/OpenSSL/freetype/harfbuzz/fribidi)
+# 主机侧只需 LLVM 17-22；ubuntu-24.04 自带 LLVM 18。
+#
+# 产物：app/build/app/PPSA99515/{eboot.bin, sce_sys/, sce_module/libc.prx}
+
+name: Build Emby5
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "wiki/**"
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm build-essential zlib1g-dev unzip curl rsync python3
+          echo "--- versions ---"
+          clang --version | head -1
+          ld.lld --version
+          llvm-config --version
+          python3 --version
+
+      - name: Set up PS5 payload SDK + pacbrew sysroot
+        run: |
+          chmod +x scripts/setup-toolchain.sh app/scripts/build.sh
+          # 无参数运行才会真正下载并合并 sysroot；--env 只打印变量
+          scripts/setup-toolchain.sh
+          scripts/setup-toolchain.sh --env > "$RUNNER_TEMP/ps5-env.sh"
+          echo "--- generated env ---"
+          cat "$RUNNER_TEMP/ps5-env.sh"
+
+      - name: Build
+        working-directory: app
+        run: |
+          # shellcheck disable=SC1090
+          source "$RUNNER_TEMP/ps5-env.sh"
+          echo "SDK = $PS5_PAYLOAD_SDK"
+          ls "$PS5_PAYLOAD_SDK/bin" | head -20
+          ./scripts/build.sh --release
+
+      - name: Inspect output
+        if: always()
+        run: |
+          echo "--- build tree (dirs) ---"
+          find app/build -maxdepth 4 -type d 2>/dev/null | head -30 || true
+          echo "--- build tree (top files) ---"
+          find app/build -maxdepth 4 -type f 2>/dev/null | head -30 || true
+          echo "--- sizes ---"
+          du -sh app/build/* 2>/dev/null || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Emby5-PPSA99515
+          path: app/build/app/PPSA99515
+          if-no-files-found: warn
+          retention-days: 14
