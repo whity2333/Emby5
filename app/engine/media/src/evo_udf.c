@@ -123,9 +123,16 @@ static AVIOContext *open_avio(const char *url, const char *agent, int timeout_ms
 {
     AVDictionary *opts = NULL;
     AVIOContext *io = NULL;
-    char t[24];
+    char t[32];
 
-    snprintf(t, sizeof t, "%d", timeout_ms);
+    /*
+     * FFmpeg's rw_timeout is in MICROSECONDS, not milliseconds. Passing the
+     * millisecond value straight through makes it a 15 ms timeout, which the
+     * proxy fails instantly with "Operation timed out" - the rest of this
+     * codebase already writes the microsecond value ("5000000" in
+     * evo_stream_io.c), so convert here and keep the caller in ms.
+     */
+    snprintf(t, sizeof t, "%d", timeout_ms > 0 ? timeout_ms * 1000 : 0);
     av_dict_set(&opts, "rw_timeout", t, 0);
     av_dict_set(&opts, "user_agent", agent, 0);
 
@@ -380,7 +387,11 @@ int evo_udf_main_title(const char *url, int64_t *offset, int64_t *size)
     if (!url || !*url || !offset || !size)
         return -1;
 
-    if (udf_walk(url, 0, &off, &len) <= 0 || len <= 0)
+    /* Build marker: the fastest way to tell from a log which binary is
+     * running when several local builds are floating around. */
+    evo_boot_log("ISO: looking for a BDMV title (iso-play/2)");
+
+    if (udf_walk(url, 1, &off, &len) <= 0 || len <= 0)
         return -1;
 
     *offset = off;

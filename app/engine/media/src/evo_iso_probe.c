@@ -19,7 +19,6 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "evo_iso_probe.h"
-#include "evo_udf.h"
 #include "evo_boot_log.h"
 
 #include <libavformat/avio.h>
@@ -203,10 +202,13 @@ int evo_iso_probe(const char *path)
 
     avio_closep(&io);
 
-    /* The real filesystem walk needs its own connection: libudfread drives the
-     * reads through its own block callbacks. */
-    if (has_udf)
-        evo_udf_inspect(path);
+    /*
+     * The BDMV walk is not done here: evo_udf_main_title() runs it once, on the
+     * playback path, and does it with logging. Walking here as well cost a
+     * second connection and a second full pass over the descriptor tree, which
+     * on a cloud-backed image is seconds of latency for no new information.
+     */
+    (void)has_udf;
 
     return is_iso ? 0 : -1;
 }
