@@ -1,0 +1,68 @@
+# Builds Emby5 with UDP debug logging (EMBY5_LOG_HOST) for testing on hardware.
+# The eboot.bin sends log lines via UDP to the host specified by EMBY5_LOG_HOST.
+name: Build with logs
+
+on:
+  workflow_dispatch:
+    inputs:
+      log_host:
+        description: "UDP log target IP (this machine, e.g. 192.168.31.127)"
+        required: true
+        default: "192.168.31.127"
+      log_port:
+        description: "UDP log target port"
+        required: false
+        default: "5555"
+
+concurrency:
+  group: emby5-log-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-18 lld-18 llvm-18 zip wget make python3
+          echo "LLVM_CONFIG=llvm-config-18" >> "$GITHUB_ENV"
+
+      - name: The version
+        id: version
+        run: |
+          ver=$(python3 -c 'import json; p=[int(x) for x in json.load(open("app/sce_sys/param.json"))["contentVersion"].split(".")]; print(f"{p[0]}.{p[1]}.{p[2]}")')
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Emby5 $ver (log build)"
+
+      - name: Toolchain cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            toolchain
+            toolkit/.deps
+          key: toolchain-${{ hashFiles('scripts/setup-toolchain.sh', 'toolkit/scripts/*.sh') }}
+
+      - name: Toolchain
+        run: bash scripts/setup-toolchain.sh
+
+      - name: Build with UDP logging
+        run: |
+          eval "$(scripts/setup-toolchain.sh --env)"
+          export EMBY5_LOG_HOST="${{ inputs.log_host }}"
+          export EMBY5_LOG_PORT="${{ inputs.log_port }}"
+          cd app
+          # NOT --release: we want the dev build with logging
+          ./scripts/build.sh
+          # Pack as a folder ZIP for easy install
+          cd build/app
+          zip -qr "Emby5-${{ steps.version.outputs.version }}-log.zip" PPSA99515
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Emby5-${{ steps.version.outputs.version }}-log
+          path: app/build/app/Emby5-${{ steps.version.outputs.version }}-log.zip
+          if-no-files-found: error
